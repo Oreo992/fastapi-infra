@@ -407,7 +407,7 @@ class DatabaseManager:
 db_manager = DatabaseManager()
 
 
-# 兼容函数 - 为业务逻辑提供简单的接口
+# 兼容函数 - 为应用层提供简单的接口
 async def init_database():
     """初始化数据库连接"""
     await db_manager.initialize()

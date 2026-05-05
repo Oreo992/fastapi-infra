@@ -78,13 +78,13 @@ class BaseRepository(IRepository[T]):
     - JSON 字段自动处理
 
     Usage:
-        class AgentRepository(BaseRepository):
+        class ResourceRepository(BaseRepository):
             def __init__(self):
                 super().__init__(
-                    table_name="agents",
+                    table_name="resources",
                     soft_delete=True,
-                    soft_delete_field="status",
-                    soft_delete_value="offline"
+                    soft_delete_field="is_active",
+                    soft_delete_value=0
                 )
     """
 
@@ -577,7 +577,7 @@ class BaseRepository(IRepository[T]):
         """
         return row
 
-    # ==================== JSON 字段处理工具 ====================
+    # ==================== JSON 字段处理辅助函数 ====================
 
     @staticmethod
     def safe_json_parse(value: Any, default: Any = None) -> Any:

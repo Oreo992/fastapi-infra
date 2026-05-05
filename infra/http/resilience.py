@@ -186,8 +186,8 @@ def with_resilience(
 class PresetConfigs:
     """预设配置"""
 
-    # LLM服务配置
-    LLM_RETRY = RetryConfig(
+    # 外部服务配置
+    EXTERNAL_SERVICE_RETRY = RetryConfig(
         max_attempts=3,
         base_delay=2.0,
         max_delay=30.0,
@@ -195,7 +195,7 @@ class PresetConfigs:
         jitter=True,
     )
 
-    LLM_TIMEOUT = TimeoutConfig(timeout_seconds=100.0)  # 增加到100秒
+    EXTERNAL_SERVICE_TIMEOUT = TimeoutConfig(timeout_seconds=100.0)
 
     # 数据库配置
     DB_RETRY = RetryConfig(max_attempts=2, base_delay=0.5, max_delay=5.0)

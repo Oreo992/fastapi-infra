@@ -208,7 +208,7 @@ async def run_in_compute_pool(func, *args, **kwargs):
     """
     在计算线程池中运行函数（便捷方法）
 
-    用于 CPU 密集型任务，如占星计算、数据处理等
+    用于 CPU 密集型任务，如统计计算、数据处理等
 
     Example:
         result = await run_in_compute_pool(heavy_calculation, param1, param2)

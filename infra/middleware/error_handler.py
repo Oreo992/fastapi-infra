@@ -75,21 +75,21 @@ def handle_error(context: ErrorContext):
 
     ```python
     @handle_error(ErrorContext(
-        operation="获取用户信息",
+        operation="获取资源详情",
         strategy=ErrorStrategy.RETURN_NONE,
-        user_message="无法获取用户信息,请稍后重试"
+        user_message="无法获取资源详情,请稍后重试"
     ))
-    async def get_user(user_id: int) -> Optional[User]:
-        # 业务逻辑
+    async def get_resource(resource_id: int) -> Optional[Resource]:
+        # 应用逻辑
         pass
 
     @handle_error(ErrorContext(
-        operation="获取工具列表",
+        operation="获取资源列表",
         strategy=ErrorStrategy.RETURN_EMPTY,
         default_value=[]
     ))
-    async def list_tools() -> List[Tool]:
-        # 业务逻辑
+    async def list_resources() -> List[Resource]:
+        # 应用逻辑
         pass
     ```
     """
@@ -199,11 +199,11 @@ class ErrorCategories:
         alert=True,
     )
 
-    # 工具执行错误 - 返回错误信息,但不中断流程
-    TOOL_EXECUTION_ERROR = ErrorContext(
-        operation="工具执行",
+    # 任务执行错误 - 返回错误信息,但不中断流程
+    TASK_EXECUTION_ERROR = ErrorContext(
+        operation="任务执行",
         strategy=ErrorStrategy.RETURN_DEFAULT,
-        default_value={"success": False, "error": "工具执行失败"},
+        default_value={"success": False, "error": "任务执行失败"},
         log_level="warning",
     )
 

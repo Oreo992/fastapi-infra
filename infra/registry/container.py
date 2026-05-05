@@ -13,10 +13,10 @@
     container = ServiceFactory.get_container()
 
     # 通过接口获取服务
-    llm_service = container.get(ILLMService)
+    service = container.get(IService)
 
     # 通过名称获取服务
-    agent_service = service_registry.get("agent_runtime_service")
+    service = service_registry.get("resource_service")
 """
 
 import inspect
