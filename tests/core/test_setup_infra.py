@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -60,12 +62,24 @@ def test_context_get_returns_registered_service_after_manual_startup():
 def test_setup_infra_rejects_repeated_configuration_without_extra_handlers():
     app = FastAPI()
     settings = InfraSettings()
-    setup_infra(app, settings, plugins=[SimplePlugin()])
     startup_count = len(app.router.on_startup)
     shutdown_count = len(app.router.on_shutdown)
 
+    setup_infra(app, settings, plugins=[SimplePlugin()])
+
     with pytest.raises(RuntimeError, match="infra is already configured"):
         setup_infra(app, settings, plugins=[SimplePlugin()])
+
+    assert len(app.router.on_startup) == startup_count
+    assert len(app.router.on_shutdown) == shutdown_count
+
+
+def test_setup_infra_does_not_append_router_lifecycle_handlers():
+    app = FastAPI()
+    startup_count = len(app.router.on_startup)
+    shutdown_count = len(app.router.on_shutdown)
+
+    setup_infra(app, InfraSettings(), plugins=[SimplePlugin()])
 
     assert len(app.router.on_startup) == startup_count
     assert len(app.router.on_shutdown) == shutdown_count
@@ -83,3 +97,27 @@ def test_registered_lifecycle_callbacks_startup_and_shutdown_plugin_once():
         assert events == ["register", "startup"]
 
     assert events == ["register", "startup", "shutdown"]
+
+
+def test_setup_infra_composes_with_existing_lifespan():
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def existing_lifespan(app: FastAPI):
+        events.append("existing_startup")
+        yield
+        events.append("existing_shutdown")
+
+    app = FastAPI(lifespan=existing_lifespan)
+    setup_infra(app, InfraSettings(), plugins=[SimplePlugin(events)])
+
+    with TestClient(app):
+        assert events == ["register", "startup", "existing_startup"]
+
+    assert events == [
+        "register",
+        "startup",
+        "existing_startup",
+        "existing_shutdown",
+        "shutdown",
+    ]

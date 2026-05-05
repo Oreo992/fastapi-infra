@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from infra.config.models import InfraSettings
@@ -18,13 +20,17 @@ def setup_infra(
     resolved_plugins = plugins if plugins is not None else get_builtin_plugins()
     context = InfraContext(app=app, settings=resolved_settings, plugins=resolved_plugins)
     app.state.infra = context
+    previous_lifespan = app.router.lifespan_context
 
-    @app.on_event("startup")
-    async def _infra_startup() -> None:
+    @asynccontextmanager
+    async def _infra_lifespan(app: FastAPI):
         await context.startup()
+        try:
+            async with previous_lifespan(app):
+                yield
+        finally:
+            await context.shutdown()
 
-    @app.on_event("shutdown")
-    async def _infra_shutdown() -> None:
-        await context.shutdown()
+    app.router.lifespan_context = _infra_lifespan
 
     return context
