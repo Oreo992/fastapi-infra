@@ -491,9 +491,9 @@ def test_duplicate_plugin_names_raise_dependency_error():
 
 
 @pytest.mark.asyncio
-async def test_invalid_plugin_config_fails_before_register_or_startup():
+async def test_forced_missing_plugin_config_fails_before_register_or_startup():
     settings = InfraSettings(
-        infra={"plugins": {"strict": {"enabled": True, "config": {"value": "bad"}}}}
+        infra={"plugins": {"strict": {"enabled": True, "config": {}}}}
     )
     plugin = StrictConfigPlugin()
     manager = PluginManager(settings=settings, plugins=[plugin])
@@ -503,3 +503,38 @@ async def test_invalid_plugin_config_fails_before_register_or_startup():
 
     assert plugin.events == []
     assert plugin.config is None
+
+
+@pytest.mark.asyncio
+async def test_auto_missing_plugin_config_is_disabled_before_register_or_startup():
+    settings = InfraSettings(
+        infra={"plugins": {"strict": {"enabled": None, "config": {}}}}
+    )
+    plugin = StrictConfigPlugin()
+    manager = PluginManager(settings=settings, plugins=[plugin])
+
+    await manager.startup()
+
+    snapshot = manager.health.snapshot()
+    assert plugin.events == []
+    assert plugin.config is None
+    assert snapshot["strict"].status is HealthState.DISABLED
+    assert "config_error" in snapshot["strict"].details
+
+
+@pytest.mark.asyncio
+async def test_disabled_missing_plugin_config_is_skipped_without_validation():
+    settings = InfraSettings(
+        infra={"plugins": {"strict": {"enabled": False, "config": {}}}}
+    )
+    plugin = StrictConfigPlugin()
+    manager = PluginManager(settings=settings, plugins=[plugin])
+
+    await manager.startup()
+
+    snapshot = manager.health.snapshot()
+    assert plugin.events == []
+    assert plugin.config is None
+    assert snapshot["strict"].status is HealthState.DISABLED
+    assert snapshot["strict"].message == "disabled by config"
+    assert snapshot["strict"].details == {}

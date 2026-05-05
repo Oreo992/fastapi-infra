@@ -1,6 +1,6 @@
 import importlib.util
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from infra.config.models import InfraSettings
 from infra.core.health import HealthRegistry, HealthState, HealthStatus
@@ -90,7 +90,17 @@ class PluginManager:
                     )
                     continue
 
-                config = self._validate_config(plugin, plugin_settings.config)
+                try:
+                    config = self._validate_config(plugin, plugin_settings.config)
+                except ValidationError as exc:
+                    if enabled is not None:
+                        raise
+                    self._set_disabled(
+                        name,
+                        "invalid plugin config",
+                        details={"config_error": str(exc)},
+                    )
+                    continue
                 ctx = PluginContext(
                     settings=self.settings,
                     plugin_settings=plugin_settings,
