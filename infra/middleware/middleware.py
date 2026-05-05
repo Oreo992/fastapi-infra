@@ -14,12 +14,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from infra.common.contracts import ApiResponse, ErrorCode, ErrorDetail
 from infra.exceptions import (
     AppException,
-    DomainException,
-    EntityNotFoundError,
-    InfrastructureException,
-    IntegrationException,
-    RepositoryError,
-    ValidationError,
+    AuthenticationError,
+    AuthorizationError,
+    ConfigurationError,
+    ExternalServiceError,
+    PluginError,
 )
 from infra.logging import get_logger, log_manager
 from infra.utils import get_timestamp
@@ -107,38 +106,32 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
     """
     统一错误处理中间件
 
-    支持新的异常体系：
-    - AppException (基础异常)
-      - DomainException (领域异常) -> 400
-        - EntityNotFoundError -> 404
-        - ValidationError -> 422
-        - BusinessRuleViolationError -> 400
-      - InfrastructureException (基础设施异常) -> 500
-        - RepositoryError -> 500
-        - DatabaseError -> 500
-        - CacheError -> 500
-      - IntegrationException (外部集成异常) -> 502
-        - ExternalServiceError -> 502
-        - LLMServiceError -> 502
+    支持基础设施异常体系：
+    - AuthenticationError -> 401
+    - AuthorizationError -> 403
+    - ConfigurationError -> 500
+    - PluginError -> 500
+    - ExternalServiceError -> 502
+    - AppException -> 500
     """
 
     # 异常类型到 HTTP 状态码的映射
     EXCEPTION_STATUS_MAP = {
-        EntityNotFoundError: 404,
-        ValidationError: 422,
-        DomainException: 400,
-        RepositoryError: 500,
-        InfrastructureException: 500,
-        IntegrationException: 502,
+        AuthenticationError: 401,
+        AuthorizationError: 403,
+        ConfigurationError: 500,
+        PluginError: 500,
+        ExternalServiceError: 502,
         AppException: 500,
     }
 
     # 错误码映射
     ERROR_CODE_MAP = {
-        EntityNotFoundError: ErrorCode.NOT_FOUND,
-        ValidationError: ErrorCode.VALIDATION_ERROR,
-        RepositoryError: ErrorCode.DATABASE_ERROR,
-        IntegrationException: ErrorCode.EXTERNAL_API_ERROR,
+        AuthenticationError: ErrorCode.UNAUTHORIZED,
+        AuthorizationError: ErrorCode.FORBIDDEN,
+        ConfigurationError: ErrorCode.CONFIGURATION_ERROR,
+        PluginError: ErrorCode.PLUGIN_ERROR,
+        ExternalServiceError: ErrorCode.EXTERNAL_SERVICE_ERROR,
     }
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
@@ -183,7 +176,7 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
         # 记录日志
         log_level = "warning" if status_code < 500 else "error"
         getattr(logger, log_level)(
-            f"业务异常: {e.message}",
+            f"应用异常: {e.message}",
             extra={
                 "error_type": type(e).__name__,
                 "error_code": e.error_code,

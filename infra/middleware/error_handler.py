@@ -7,11 +7,8 @@
 3. 降级策略明确
 4. 用户友好的错误信息
 
-与新的异常体系集成:
+与基础设施异常体系集成:
 - AppException: 应用基础异常
-- DomainException: 领域/业务异常
-- InfrastructureException: 基础设施异常
-- IntegrationException: 外部集成异常
 """
 
 from collections.abc import Callable
@@ -19,14 +16,7 @@ from enum import Enum
 from functools import wraps
 from typing import Any, TypeVar
 
-from infra.exceptions import (
-    AppException,
-    DomainException,
-    InfrastructureException,
-    IntegrationException,
-    RepositoryError,
-    ValidationError,
-)
+from infra.exceptions import AppException
 from infra.logging import get_logger
 
 
@@ -79,7 +69,7 @@ def handle_error(context: ErrorContext):
     """
     错误处理装饰器
 
-    支持新的异常体系，自动识别异常类型并采取适当的处理策略
+    支持基础设施异常体系，自动识别异常类型并采取适当的处理策略
 
     使用示例:
 
@@ -110,80 +100,7 @@ def handle_error(context: ErrorContext):
             try:
                 return await func(*args, **kwargs)
 
-            except ValidationError as e:
-                # 验证错误通常应该传播给调用方
-                logger.warning(
-                    f"{context.operation}失败 - 验证错误: {e.message}",
-                    extra={
-                        "operation": context.operation,
-                        "error_type": "ValidationError",
-                        "error_code": e.error_code,
-                        "details": e.details,
-                    },
-                )
-                raise
-
-            except DomainException as e:
-                # 领域/业务异常
-                log_func = getattr(logger, context.log_level)
-                log_func(
-                    f"{context.operation}失败 - 业务异常: {e.message}",
-                    extra={
-                        "operation": context.operation,
-                        "error_type": type(e).__name__,
-                        "error_code": e.error_code,
-                        "details": e.details,
-                    },
-                )
-                return _handle_by_strategy(context, e)
-
-            except RepositoryError as e:
-                # Repository 异常
-                log_func = logger.error
-                log_func(
-                    f"{context.operation}失败 - 数据访问异常: {e.message}",
-                    extra={
-                        "operation": context.operation,
-                        "error_type": "RepositoryError",
-                        "error_code": e.error_code,
-                        "details": e.details,
-                        "alert": True,
-                    },
-                )
-                return _handle_by_strategy(context, e)
-
-            except InfrastructureException as e:
-                # 基础设施异常
-                log_func = logger.error
-                log_func(
-                    f"{context.operation}失败 - 基础设施异常: {e.message}",
-                    extra={
-                        "operation": context.operation,
-                        "error_type": type(e).__name__,
-                        "error_code": e.error_code,
-                        "details": e.details,
-                        "alert": True,
-                    },
-                )
-                return _handle_by_strategy(context, e)
-
-            except IntegrationException as e:
-                # 外部集成异常
-                log_func = getattr(logger, context.log_level)
-                log_func(
-                    f"{context.operation}失败 - 外部服务异常: {e.message}",
-                    extra={
-                        "operation": context.operation,
-                        "error_type": type(e).__name__,
-                        "error_code": e.error_code,
-                        "details": e.details,
-                        "alert": context.alert,
-                    },
-                )
-                return _handle_by_strategy(context, e)
-
             except AppException as e:
-                # 其他应用异常
                 log_func = getattr(logger, context.log_level)
                 log_func(
                     f"{context.operation}失败 - 应用异常: {e.message}",
@@ -266,16 +183,16 @@ class ErrorCategories:
     )
 
     # 缓存读取错误 - 降级处理,不影响主流程
-    CACHE_ERROR = ErrorContext(
+    CACHE_ACCESS_ERROR = ErrorContext(
         operation="缓存操作",
         strategy=ErrorStrategy.RETURN_NONE,
         log_level="warning",
         alert=False,
     )
 
-    # 外部API调用错误 - 需要告警
-    EXTERNAL_API_ERROR = ErrorContext(
-        operation="外部API调用",
+    # 外部服务调用错误 - 需要告警
+    EXTERNAL_SERVICE_ERROR = ErrorContext(
+        operation="外部服务调用",
         strategy=ErrorStrategy.PROPAGATE,
         log_level="error",
         user_message="外部服务暂时不可用,请稍后重试",
@@ -290,8 +207,8 @@ class ErrorCategories:
         log_level="warning",
     )
 
-    # Repository 操作错误 - 传播异常
-    REPOSITORY_ERROR = ErrorContext(
+    # 数据访问操作错误 - 传播异常
+    DATA_ACCESS_ERROR = ErrorContext(
         operation="数据访问",
         strategy=ErrorStrategy.PROPAGATE,
         log_level="error",
@@ -337,7 +254,7 @@ def handle_cache_error(operation: str):
 
 
 def handle_repository_error(operation: str):
-    """处理 Repository 错误（传播异常）"""
+    """处理数据访问错误（传播异常）"""
     return handle_error(
         ErrorContext(
             operation=operation,

@@ -20,9 +20,7 @@ from typing import Any, Generic, TypeVar
 
 import aiomysql
 
-from infra.exceptions import (
-    RepositoryError,
-)
+from infra.exceptions import AppException
 from infra.database.manager import db_manager
 from infra.http.resilience import PresetConfigs, with_resilience
 from infra.logging import get_logger
@@ -182,7 +180,7 @@ class BaseRepository(IRepository[T]):
             创建后的实体数据（包含自动生成的字段）
 
         Raises:
-            RepositoryError: 创建失败时抛出
+            AppException: 创建失败时抛出
         """
         try:
             # 准备数据
@@ -205,9 +203,7 @@ class BaseRepository(IRepository[T]):
 
         except Exception as e:
             logger.error(f"创建 {self.table_name} 失败: {e}")
-            raise RepositoryError(
-                operation="create", entity_type=self.table_name, message=str(e)
-            ) from e
+            raise self._repository_error("create", e) from e
 
     @with_resilience(
         timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
@@ -224,7 +220,7 @@ class BaseRepository(IRepository[T]):
             更新后的实体数据，实体不存在返回 None
 
         Raises:
-            RepositoryError: 更新失败时抛出
+            AppException: 更新失败时抛出
         """
         if not data:
             return await self.get_by_id(id)
@@ -258,9 +254,7 @@ class BaseRepository(IRepository[T]):
 
         except Exception as e:
             logger.error(f"更新 {self.table_name} 失败: {e}")
-            raise RepositoryError(
-                operation="update", entity_type=self.table_name, message=str(e)
-            ) from e
+            raise self._repository_error("update", e) from e
 
     @with_resilience(
         timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
@@ -304,9 +298,18 @@ class BaseRepository(IRepository[T]):
 
         except Exception as e:
             logger.error(f"删除 {self.table_name} 失败: {e}")
-            raise RepositoryError(
-                operation="delete", entity_type=self.table_name, message=str(e)
-            ) from e
+            raise self._repository_error("delete", e) from e
+
+    def _repository_error(self, operation: str, error: Exception) -> AppException:
+        return AppException(
+            message=f"Repository {operation} failed for {self.table_name}: {error}",
+            error_code="EXTERNAL_SERVICE_ERROR",
+            details={
+                "service_name": "database",
+                "operation": operation,
+                "table_name": self.table_name,
+            },
+        )
 
     # ==================== 查询方法 ====================
 

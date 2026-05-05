@@ -13,7 +13,7 @@ from typing import Any
 
 import redis.asyncio as redis
 
-from infra.database import DatabaseManager
+from infra.database.manager import DatabaseManager
 from infra.logging import get_logger
 
 
