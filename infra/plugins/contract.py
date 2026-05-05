@@ -1,4 +1,3 @@
-from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
@@ -22,6 +21,7 @@ class PluginContext(BaseModel):
     settings: InfraSettings
     plugin_settings: PluginSettings
     services: dict[str, Any]
+    config: BaseModel | None = None
 
     def health_status(
         self,
