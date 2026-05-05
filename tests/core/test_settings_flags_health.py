@@ -50,3 +50,59 @@ def test_health_registry_tracks_disabled_and_healthy_statuses():
     assert result["ai"].status is HealthState.HEALTHY
     assert result["payment"].status is HealthState.DISABLED
     assert result["payment"].message == "disabled by config"
+
+
+def test_health_registry_is_not_affected_by_mutating_original_status():
+    registry = HealthRegistry()
+    status = HealthStatus(
+        name="ai",
+        status=HealthState.HEALTHY,
+        details={"checks": {"database": "ok"}},
+    )
+
+    registry.set_status(status)
+    status.status = HealthState.UNHEALTHY
+    status.details["checks"]["database"] = "failed"
+
+    result = registry.snapshot()
+
+    assert result["ai"].status is HealthState.HEALTHY
+    assert result["ai"].details == {"checks": {"database": "ok"}}
+
+
+def test_health_registry_snapshot_returns_independent_status_models():
+    registry = HealthRegistry()
+    registry.set_status(
+        HealthStatus(
+            name="ai",
+            status=HealthState.HEALTHY,
+            details={"checks": {"database": "ok"}},
+        )
+    )
+
+    first_snapshot = registry.snapshot()
+    first_snapshot["ai"].status = HealthState.DEGRADED
+    first_snapshot["ai"].details["checks"]["database"] = "slow"
+
+    second_snapshot = registry.snapshot()
+
+    assert second_snapshot["ai"].status is HealthState.HEALTHY
+    assert second_snapshot["ai"].details == {"checks": {"database": "ok"}}
+
+
+def test_public_exports_include_settings_flags_and_health_models():
+    from infra.config import InfraSettings as ExportedInfraSettings
+    from infra.config import PluginSettings as ExportedPluginSettings
+    from infra.core import FeatureFlag as ExportedFeatureFlag
+    from infra.core import HealthRegistry as ExportedHealthRegistry
+    from infra.core import HealthState as ExportedHealthState
+    from infra.core import HealthStatus as ExportedHealthStatus
+    from infra.core import resolve_feature_flag as exported_resolve_feature_flag
+
+    assert ExportedInfraSettings is InfraSettings
+    assert ExportedPluginSettings is PluginSettings
+    assert ExportedFeatureFlag is FeatureFlag
+    assert ExportedHealthRegistry is HealthRegistry
+    assert ExportedHealthState is HealthState
+    assert ExportedHealthStatus is HealthStatus
+    assert exported_resolve_feature_flag is resolve_feature_flag

@@ -23,7 +23,7 @@ class HealthRegistry:
         self._statuses: dict[str, HealthStatus] = {}
 
     def set_status(self, status: HealthStatus) -> None:
-        self._statuses[status.name] = status
+        self._statuses[status.name] = status.model_copy(deep=True)
 
     def snapshot(self) -> dict[str, HealthStatus]:
-        return dict(self._statuses)
+        return {name: status.model_copy(deep=True) for name, status in self._statuses.items()}
