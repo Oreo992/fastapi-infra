@@ -11,6 +11,9 @@ def setup_infra(
     settings: InfraSettings | None = None,
     plugins: list[InfraPlugin] | None = None,
 ) -> InfraContext:
+    if hasattr(app.state, "infra"):
+        raise RuntimeError("infra is already configured")
+
     resolved_settings = settings or InfraSettings()
     resolved_plugins = plugins if plugins is not None else get_builtin_plugins()
     context = InfraContext(app=app, settings=resolved_settings, plugins=resolved_plugins)

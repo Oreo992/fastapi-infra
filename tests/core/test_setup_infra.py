@@ -1,4 +1,6 @@
+import pytest
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from infra import InfraSettings, setup_infra
 from infra.core.context import InfraContext
@@ -10,13 +12,22 @@ class SimplePlugin:
     metadata = PluginMetadata(name="simple", version="1.0.0", default_enabled=True)
     config_model = None
 
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events = events
+
     def register(self, ctx: PluginContext) -> None:
+        if self.events is not None:
+            self.events.append("register")
         ctx.services["simple"] = {"ready": True}
 
     async def startup(self, ctx: PluginContext) -> None:
+        if self.events is not None:
+            self.events.append("startup")
         return None
 
     async def shutdown(self, ctx: PluginContext) -> None:
+        if self.events is not None:
+            self.events.append("shutdown")
         return None
 
     async def health_check(self, ctx: PluginContext):
@@ -44,3 +55,31 @@ def test_context_get_returns_registered_service_after_manual_startup():
     anyio.run(infra.startup)
 
     assert infra.get("simple") == {"ready": True}
+
+
+def test_setup_infra_rejects_repeated_configuration_without_extra_handlers():
+    app = FastAPI()
+    settings = InfraSettings()
+    setup_infra(app, settings, plugins=[SimplePlugin()])
+    startup_count = len(app.router.on_startup)
+    shutdown_count = len(app.router.on_shutdown)
+
+    with pytest.raises(RuntimeError, match="infra is already configured"):
+        setup_infra(app, settings, plugins=[SimplePlugin()])
+
+    assert len(app.router.on_startup) == startup_count
+    assert len(app.router.on_shutdown) == shutdown_count
+
+
+def test_registered_lifecycle_callbacks_startup_and_shutdown_plugin_once():
+    app = FastAPI()
+    settings = InfraSettings()
+    events: list[str] = []
+    setup_infra(app, settings, plugins=[SimplePlugin(events)])
+
+    assert events == []
+
+    with TestClient(app):
+        assert events == ["register", "startup"]
+
+    assert events == ["register", "startup", "shutdown"]
