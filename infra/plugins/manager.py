@@ -104,18 +104,35 @@ class PluginManager:
                 self.services.update(ctx.services)
                 self.started_plugins.append(name)
                 self.active_plugins.add(name)
-                self.health.set_status(await plugin.health_check(ctx))
+                health_status = await plugin.health_check(ctx)
+                self.health.set_status(health_status)
+                if health_status.status is HealthState.UNHEALTHY:
+                    raise PluginDependencyError(f"plugin is unhealthy: {name}")
                 self.services.update(ctx.services)
         except Exception:
-            await self.shutdown()
+            try:
+                await self.shutdown()
+            except Exception:
+                pass
             raise
 
     async def shutdown(self) -> None:
-        for name in reversed(self.started_plugins):
+        first_error: Exception | None = None
+        while self.started_plugins:
+            name = self.started_plugins.pop()
             plugin = self.plugins[name]
-            ctx = self._contexts[name]
-            await plugin.shutdown(ctx)
+            ctx = self._contexts.pop(name, None)
             self.active_plugins.discard(name)
+            if ctx is None:
+                continue
+            try:
+                await plugin.shutdown(ctx)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if first_error is not None:
+            raise first_error
 
     def _resolve_order(self) -> list[str]:
         resolved: list[str] = []
