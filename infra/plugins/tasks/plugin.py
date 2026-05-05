@@ -17,6 +17,8 @@ class TasksPluginConfig(BaseModel):
     database_service: str = "database"
     stream_name: str = "infra:tasks"
     consumer_group: str = "infra"
+    consumer_name: str = "tasks"
+    pending_min_idle_ms: int = 60_000
 
 
 class TasksPlugin:
@@ -38,6 +40,8 @@ class TasksPlugin:
                 config.redis,
                 stream_name=config.stream_name,
                 consumer_group=config.consumer_group,
+                consumer_name=config.consumer_name,
+                pending_min_idle_ms=config.pending_min_idle_ms,
             )
 
     async def startup(self, ctx: PluginContext) -> None:
@@ -58,6 +62,8 @@ class TasksPlugin:
             redis,
             stream_name=config.stream_name,
             consumer_group=config.consumer_group,
+            consumer_name=config.consumer_name,
+            pending_min_idle_ms=config.pending_min_idle_ms,
         )
         return None
 

@@ -18,6 +18,7 @@ class CachePlugin:
     metadata = PluginMetadata(
         name="cache",
         version="1.0.0",
+        optional_dependencies=["orjson", "aiomysql", "redis"],
         default_enabled=False,
         provides=["cache"],
     )
@@ -34,7 +35,9 @@ class CachePlugin:
         return None
 
     async def shutdown(self, ctx: PluginContext) -> None:
-        return None
+        cache = ctx.services.get("cache")
+        if cache is not None:
+            await cache._db_manager.close()
 
     async def health_check(self, ctx: PluginContext) -> HealthStatus:
         return ctx.health_status("cache", HealthState.HEALTHY)

@@ -123,6 +123,20 @@ class ShutdownFailingRollbackPlugin(FakePlugin):
         raise RuntimeError("shutdown failed")
 
 
+class RetryableShutdownFailingPlugin(FakePlugin):
+    metadata = PluginMetadata(name="retryable_shutdown_failing", version="1.0.0")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.shutdown_attempts = 0
+
+    async def shutdown(self, ctx: PluginContext) -> None:
+        self.events.append("shutdown")
+        self.shutdown_attempts += 1
+        if self.shutdown_attempts == 1:
+            raise RuntimeError("shutdown failed")
+
+
 class TrackingRollbackPlugin(FakePlugin):
     metadata = PluginMetadata(name="tracking_rollback", version="1.0.0")
 
@@ -171,6 +185,22 @@ async def test_enabled_plugin_registers_starts_and_stops():
 
     assert plugin.events == ["register", "startup", "shutdown"]
     assert manager.get("fake") is plugin
+
+
+@pytest.mark.asyncio
+async def test_repeated_startup_before_shutdown_raises_without_double_starting():
+    settings = InfraSettings(infra={"plugins": {"fake": {"enabled": True}}})
+    plugin = FakePlugin()
+    manager = PluginManager(settings=settings, plugins=[plugin])
+
+    await manager.startup()
+
+    with pytest.raises(RuntimeError, match="already started"):
+        await manager.startup()
+
+    assert plugin.events == ["register", "startup"]
+    assert manager.started_plugins == ["fake"]
+    assert manager.active_plugins == {"fake"}
 
 
 @pytest.mark.asyncio
@@ -263,11 +293,11 @@ async def test_startup_failure_rolls_back_already_started_plugins():
         await manager.startup()
 
     assert fake.events == ["register", "startup", "shutdown"]
-    assert failing.events == ["register", "startup"]
+    assert failing.events == ["register", "startup", "shutdown"]
 
 
 @pytest.mark.asyncio
-async def test_current_plugin_startup_failure_does_not_leak_services_or_context():
+async def test_current_plugin_startup_failure_rolls_back_and_does_not_leak_services_or_context():
     settings = InfraSettings(
         infra={"plugins": {"register_then_startup_failing": {"enabled": True}}}
     )
@@ -277,9 +307,35 @@ async def test_current_plugin_startup_failure_does_not_leak_services_or_context(
     with pytest.raises(RuntimeError, match="startup failed"):
         await manager.startup()
 
-    assert plugin.events == ["register", "startup"]
+    assert plugin.events == ["register", "startup", "shutdown"]
     assert manager.get("leaky", default=None) is None
     assert "register_then_startup_failing" not in manager._contexts
+
+
+@pytest.mark.asyncio
+async def test_shutdown_failure_keeps_state_for_retry():
+    settings = InfraSettings(
+        infra={"plugins": {"retryable_shutdown_failing": {"enabled": True}}}
+    )
+    plugin = RetryableShutdownFailingPlugin()
+    manager = PluginManager(settings=settings, plugins=[plugin])
+
+    await manager.startup()
+
+    with pytest.raises(RuntimeError, match="shutdown failed"):
+        await manager.shutdown()
+
+    assert plugin.events == ["register", "startup", "shutdown"]
+    assert manager.started_plugins == ["retryable_shutdown_failing"]
+    assert manager.active_plugins == {"retryable_shutdown_failing"}
+    assert "retryable_shutdown_failing" in manager._contexts
+
+    await manager.shutdown()
+
+    assert plugin.events == ["register", "startup", "shutdown", "shutdown"]
+    assert manager.started_plugins == []
+    assert manager.active_plugins == set()
+    assert "retryable_shutdown_failing" not in manager._contexts
 
 
 @pytest.mark.asyncio
@@ -316,7 +372,7 @@ async def test_shutdown_after_startup_rollback_is_noop():
     await manager.shutdown()
 
     assert fake.events == ["register", "startup", "shutdown"]
-    assert failing.events == ["register", "startup"]
+    assert failing.events == ["register", "startup", "shutdown"]
 
 
 @pytest.mark.asyncio
@@ -345,7 +401,7 @@ async def test_rollback_preserves_original_error_and_attempts_all_shutdowns():
     assert attempts == ["shutdown_failing_rollback", "tracking_rollback"]
     assert tracking.events == ["register", "startup", "shutdown"]
     assert shutdown_failing.events == ["register", "startup", "shutdown"]
-    assert startup_failing.events == ["register", "startup"]
+    assert startup_failing.events == ["register", "startup", "shutdown"]
     assert manager.started_plugins == []
 
 

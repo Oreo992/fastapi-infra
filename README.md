@@ -46,6 +46,26 @@ async def health():
 - `ratelimit`
 - `notifications`
 
+`database`、`cache` 和 `http` 也在内置插件列表里，但默认关闭。需要真实
+MySQL、Redis、HTTP 客户端时再通过 `enabled=True` 打开，并安装对应
+optional dependencies。
+
+## 可观测性路由
+
+`observability` 插件会注册内存中的计数、耗时和健康状态服务，但 HTTP
+路由需要显式安装：
+
+```python
+from infra.plugins.observability import install_observability_routes
+
+install_observability_routes(app, infra, prefix="/ops")
+```
+
+上面的调用会添加 `/ops/healthz`、`/ops/readyz` 和 `/ops/metrics`。
+`readyz` 只有在任一健康状态为 `unhealthy` 时返回 `503`，其他状态返回
+`200`。`metrics` 使用简单的 `text/plain` 文本格式，例如
+`requests_total 3`，适合没有接入 `prometheus_client` 的轻量场景。
+
 ## 动态开关
 
 每个插件都通过 `InfraSettings.infra.plugins` 控制：
@@ -86,6 +106,33 @@ pip install -e ".[ai-openai]"
 pip install -e ".[ai-anthropic]"
 pip install -e ".[ai-gemini]"
 ```
+
+## Redis 任务队列
+
+`tasks` 默认是内存队列。需要跨进程任务分发时可以切换到 Redis Streams：
+
+```python
+settings = InfraSettings(
+    infra={
+        "plugins": {
+            "database": {"enabled": True},
+            "tasks": {
+                "enabled": True,
+                "config": {
+                    "adapter": "redis",
+                    "stream_name": "myapp:tasks",
+                    "consumer_group": "workers",
+                    "consumer_name": "worker-1",
+                    "pending_min_idle_ms": 60000,
+                },
+            },
+        }
+    }
+)
+```
+
+Redis adapter 会创建 consumer group，空队列时非阻塞返回 `None`，并优先恢复
+超过 `pending_min_idle_ms` 的 pending 任务。
 
 ## 文档和示例
 

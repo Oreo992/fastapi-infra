@@ -4,7 +4,7 @@ import pytest
 
 from infra.config.models import InfraSettings
 from infra.plugins.builtin import get_builtin_plugins
-from infra.plugins.manager import PluginManager
+from infra.plugins.manager import PluginDependencyError, PluginManager
 
 
 def test_builtin_plugins_include_optional_backend_plugin_names():
@@ -45,9 +45,17 @@ async def test_enabled_backend_plugins_register_fake_services(monkeypatch):
         async def close(self):
             self.closed = True
 
+    class FakeCacheDatabaseManager:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
     class FakeCacheService:
         def __init__(self, namespace=""):
             self.namespace = namespace
+            self._db_manager = FakeCacheDatabaseManager()
 
     class FakeHttpClient:
         def __init__(self, base_url="", timeout=30.0, headers=None):
@@ -119,4 +127,35 @@ async def test_enabled_backend_plugins_register_fake_services(monkeypatch):
     await manager.shutdown()
 
     assert database.closed is True
+    assert cache._db_manager.closed is True
     assert http.closed is True
+
+
+@pytest.mark.asyncio
+async def test_enabled_cache_plugin_requires_service_import_dependencies(monkeypatch):
+    from infra.plugins.cache import plugin as cache_plugin
+
+    expected_dependencies = {"orjson", "aiomysql", "redis"}
+    assert set(cache_plugin.CachePlugin.metadata.optional_dependencies) == expected_dependencies
+
+    original_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name):
+        if name in expected_dependencies:
+            return None
+        return original_find_spec(name)
+
+    def fail_if_cache_service_imports():
+        pytest.fail("cache service should not be imported when dependencies are missing")
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.setattr(cache_plugin, "_load_cache_service", fail_if_cache_service_imports)
+
+    settings = InfraSettings(infra={"plugins": {"cache": {"enabled": True}}})
+    manager = PluginManager(settings=settings, plugins=[cache_plugin.CachePlugin()])
+
+    with pytest.raises(PluginDependencyError, match="missing optional dependency") as exc:
+        await manager.startup()
+
+    for dependency in expected_dependencies:
+        assert dependency in str(exc.value)

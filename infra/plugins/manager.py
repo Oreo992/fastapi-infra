@@ -25,15 +25,20 @@ class PluginManager:
         self.started_plugins: list[str] = []
         self.active_plugins: set[str] = set()
         self._contexts: dict[str, PluginContext] = {}
+        self._started = False
 
     def get(self, name: str, default: object = None) -> object:
         return self.services.get(name, default)
 
     async def startup(self) -> None:
+        if self._started:
+            raise RuntimeError("plugin manager is already started")
+
         services_before_startup = dict(self.services)
         contexts_before_startup = dict(self._contexts)
         started_before_startup = list(self.started_plugins)
         active_before_startup = set(self.active_plugins)
+        was_started = self._started
         try:
             for name in self._resolve_order():
                 plugin = self.plugins[name]
@@ -114,8 +119,8 @@ class PluginManager:
                 )
                 self._contexts[name] = ctx
                 plugin.register(ctx)
-                await plugin.startup(ctx)
                 self.started_plugins.append(name)
+                await plugin.startup(ctx)
                 self.active_plugins.add(name)
                 health_status = await plugin.health_check(ctx)
                 self.health.set_status(health_status)
@@ -123,6 +128,7 @@ class PluginManager:
                     raise PluginDependencyError(f"plugin is unhealthy: {name}")
                 self.services.clear()
                 self.services.update(ctx.services)
+            self._started = True
         except Exception:
             try:
                 await self.shutdown()
@@ -133,25 +139,32 @@ class PluginManager:
             self._contexts = contexts_before_startup
             self.started_plugins = started_before_startup
             self.active_plugins = active_before_startup
+            self._started = was_started
             raise
 
     async def shutdown(self) -> None:
         first_error: Exception | None = None
-        while self.started_plugins:
-            name = self.started_plugins.pop()
+        for name in reversed(list(self.started_plugins)):
             plugin = self.plugins[name]
-            ctx = self._contexts.pop(name, None)
-            self.active_plugins.discard(name)
+            ctx = self._contexts.get(name)
             if ctx is None:
+                self.started_plugins.remove(name)
+                self.active_plugins.discard(name)
                 continue
             try:
                 await plugin.shutdown(ctx)
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
+                continue
+
+            self.started_plugins.remove(name)
+            self._contexts.pop(name, None)
+            self.active_plugins.discard(name)
 
         if first_error is not None:
             raise first_error
+        self._started = False
 
     def _resolve_order(self) -> list[str]:
         resolved: list[str] = []
