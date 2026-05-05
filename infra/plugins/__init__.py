@@ -1,3 +1,10 @@
-"""插件系统"""
+from infra.plugins.contract import InfraPlugin, PluginContext, PluginMetadata
+from infra.plugins.manager import PluginDependencyError, PluginManager
 
-# 插件系统基础设施将在后续版本完善
+__all__ = [
+    "InfraPlugin",
+    "PluginContext",
+    "PluginDependencyError",
+    "PluginManager",
+    "PluginMetadata",
+]
