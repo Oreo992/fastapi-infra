@@ -24,12 +24,6 @@ from typing import Any, TypeVar
 
 from infra.registry import service_registry
 from infra.logging import get_logger
-# 业务接口已移除
-# from app.interfaces.llm_service_interface import (
-#     IDialogueService,
-#     ILLMService,
-#     ITaskJudgeService,
-# )
 
 
 logger = get_logger(__name__)
@@ -180,4 +174,3 @@ class ServiceFactory:
     def is_initialized(cls) -> bool:
         """检查是否已初始化"""
         return cls._initialized
-
