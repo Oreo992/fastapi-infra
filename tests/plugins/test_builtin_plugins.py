@@ -11,6 +11,9 @@ def test_builtin_plugins_include_first_batch_plugin_names():
     assert names == [
         "ai",
         "auth",
+        "database",
+        "cache",
+        "http",
         "observability",
         "tasks",
         "storage",
