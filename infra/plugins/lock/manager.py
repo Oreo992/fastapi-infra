@@ -11,7 +11,7 @@ import asyncio
 import uuid
 from contextlib import asynccontextmanager
 
-from infra.database.manager import get_redis
+from infra.database.manager import DatabaseManager
 from infra.logging import get_logger
 
 logger = get_logger(__name__)
@@ -26,13 +26,14 @@ class LockAcquisitionError(Exception):
 class DistributedLockManager:
     """基于Redis的分布式锁管理器"""
 
-    def __init__(self, prefix: str = "lock"):
+    def __init__(self, prefix: str = "lock", db: DatabaseManager | None = None):
         """初始化锁管理器
 
         Args:
             prefix: 锁key的前缀，用于命名空间隔离
         """
         self.prefix = prefix
+        self._db = db or DatabaseManager()
         self._lock_tokens = {}  # {key: token} 记录已获取的锁
 
     def _build_key(self, key: str) -> str:
@@ -67,7 +68,7 @@ class DistributedLockManager:
         Raises:
             LockAcquisitionError: 获取锁失败
         """
-        redis = await get_redis()
+        redis = await self._get_redis()
         lock_key = self._build_key(key)
         token = str(uuid.uuid4())
 
@@ -110,7 +111,7 @@ class DistributedLockManager:
         Returns:
             是否成功释放
         """
-        redis = await get_redis()
+        redis = await self._get_redis()
         lock_key = self._build_key(key)
 
         # Lua脚本：只有token匹配才删除
@@ -143,7 +144,7 @@ class DistributedLockManager:
         Returns:
             是否成功延期
         """
-        redis = await get_redis()
+        redis = await self._get_redis()
         lock_key = self._build_key(key)
 
         # Lua脚本：只有token匹配才延期
@@ -187,3 +188,7 @@ class DistributedLockManager:
         finally:
             if token:
                 await self.release(key, token)
+
+    async def _get_redis(self):
+        await self._db.initialize()
+        return await self._db._get_or_create_redis_client()

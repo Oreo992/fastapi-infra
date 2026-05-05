@@ -363,8 +363,7 @@ class DatabaseManager:
         if loop_id not in self._redis_clients:
             raise RuntimeError(
                 "当前事件循环的Redis客户端未初始化。"
-                "请先调用 await db_manager._get_or_create_redis_client() "
-                "或使用 await get_redis() 函数"
+                "请先初始化 DatabaseManager 或调用 _get_or_create_redis_client()。"
             )
 
         return self._redis_clients[loop_id]
@@ -401,48 +400,3 @@ class DatabaseManager:
             }
         except Exception as e:
             return {"initialized": True, "error": str(e)}
-
-
-# 全局数据库管理器实例
-db_manager = DatabaseManager()
-
-
-# 兼容函数 - 为应用层提供简单的接口
-async def init_database():
-    """初始化数据库连接"""
-    await db_manager.initialize()
-
-
-async def close_database():
-    """关闭数据库连接"""
-    await db_manager.close()
-
-
-async def check_database_health() -> bool:
-    """检查数据库连接健康状态"""
-    return await db_manager.health_check()
-
-
-async def get_db_connection():
-    """FastAPI依赖：获取aiomysql数据库连接"""
-    async with db_manager.get_connection() as conn:
-        yield conn
-
-
-async def get_redis():
-    """
-    获取当前事件循环的Redis客户端
-
-    该函数确保每个事件循环都有自己的Redis客户端，
-    避免在多事件循环环境下出现"Future attached to a different loop"错误
-    """
-    await db_manager.initialize()  # 确保已初始化
-    return await db_manager._get_or_create_redis_client()
-
-
-@asynccontextmanager
-async def get_db_session():
-    """获取数据库会话(用于Repository)"""
-    await db_manager.initialize()  # 确保已初始化
-    async with db_manager.get_connection() as conn:
-        yield conn

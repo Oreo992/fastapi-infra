@@ -21,7 +21,7 @@ from typing import Any, Generic, TypeVar
 import aiomysql
 
 from infra.exceptions import AppException
-from infra.database.manager import db_manager
+from infra.database.manager import DatabaseManager
 from infra.http.resilience import PresetConfigs, with_resilience
 from infra.logging import get_logger
 from infra.utils.timezone import get_timestamp
@@ -122,8 +122,7 @@ class BaseRepository(IRepository[T]):
         self.created_at_field = created_at_field
         self.updated_at_field = updated_at_field
 
-        # 数据库管理器
-        self._db = db_manager
+        self._db = DatabaseManager()
 
     # ==================== 连接管理 ====================
 
@@ -648,13 +647,14 @@ class UnitOfWork:
             # 自动提交或回滚
     """
 
-    def __init__(self):
+    def __init__(self, db: DatabaseManager | None = None):
+        self._db = db or DatabaseManager()
         self._connection = None
         self._in_transaction = False
 
     async def __aenter__(self):
-        await db_manager.initialize()
-        self._connection = await db_manager.acquire_connection()
+        await self._db.initialize()
+        self._connection = await self._db.acquire_connection()
         await self._connection.begin()
         self._in_transaction = True
         return self
@@ -667,7 +667,7 @@ class UnitOfWork:
                 await self._connection.rollback()
         finally:
             if self._connection:
-                await db_manager.release_connection(self._connection)
+                await self._db.release_connection(self._connection)
                 self._connection = None
                 self._in_transaction = False
 
