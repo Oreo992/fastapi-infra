@@ -3,7 +3,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, Field
 
 from infra.config.models import InfraSettings, PluginSettings
-from infra.core.health import HealthState, HealthStatus
+from infra.core.health import HealthRegistry, HealthState, HealthStatus
 
 
 class PluginMetadata(BaseModel):
@@ -21,6 +21,7 @@ class PluginContext(BaseModel):
     settings: InfraSettings
     plugin_settings: PluginSettings
     services: dict[str, Any]
+    health: HealthRegistry
     config: BaseModel | None = None
 
     def health_status(

@@ -105,6 +105,7 @@ class PluginManager:
                     settings=self.settings,
                     plugin_settings=plugin_settings,
                     services=self.services,
+                    health=self.health,
                     config=config,
                 )
                 self._contexts[name] = ctx
