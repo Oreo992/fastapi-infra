@@ -11,7 +11,7 @@ class AIRegistry:
 
     def register(self, provider: AIProvider, *, default: bool = False) -> None:
         self._providers[provider.name] = provider
-        if default or self.default_provider not in self._providers:
+        if default:
             self.default_provider = provider.name
 
     def get(self, provider: str | None = None) -> AIProvider:

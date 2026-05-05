@@ -3,9 +3,11 @@ from typing import Any
 
 from infra.plugins.ai.adapters._shared import (
     definition_dicts,
+    iter_any,
     maybe_await,
     message_dicts,
     text_from,
+    tool_calls_from,
 )
 from infra.plugins.ai.models import ChatChunk, ChatRequest, ChatResponse
 
@@ -24,6 +26,7 @@ class AnthropicAIProvider:
             provider=self.name,
             model=request.model,
             content=text_from(response),
+            tool_calls=tool_calls_from(response),
             raw=response,
         )
 
@@ -33,6 +36,15 @@ class AnthropicAIProvider:
             chunks = text_stream() if callable(text_stream) else text_stream
             async for text in chunks:
                 yield ChatChunk(provider=self.name, model=request.model, content=text)
+            if hasattr(stream, "__aiter__"):
+                async for item in iter_any(stream):
+                    tool_calls = tool_calls_from(item)
+                    if tool_calls:
+                        yield ChatChunk(
+                            provider=self.name,
+                            model=request.model,
+                            tool_calls=tool_calls,
+                        )
 
     def _kwargs(self, request: ChatRequest) -> dict[str, Any]:
         kwargs: dict[str, Any] = {

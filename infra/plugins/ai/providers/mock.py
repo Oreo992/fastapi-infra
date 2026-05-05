@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator
 
-from infra.plugins.ai.models import ChatChunk, ChatRequest, ChatResponse, _Call
+from infra.plugins.ai.models import ChatChunk, ChatRequest, ChatResponse, ToolCall
 
 
 class MockAIProvider:
@@ -14,7 +14,7 @@ class MockAIProvider:
                 model=request.model,
                 content="",
                 tool_calls=[
-                    _Call(
+                    ToolCall(
                         id="mock-call-1",
                         name=first.name,
                         arguments={"query": "mock"},

@@ -7,6 +7,7 @@ from infra.plugins.ai.adapters._shared import (
     maybe_await,
     message_dicts,
     text_from,
+    tool_calls_from,
 )
 from infra.plugins.ai.models import ChatChunk, ChatRequest, ChatResponse
 
@@ -25,6 +26,7 @@ class OpenAIProvider:
             provider=self.name,
             model=request.model,
             content=text_from(response),
+            tool_calls=tool_calls_from(response),
             raw=response,
         )
 
@@ -38,6 +40,7 @@ class OpenAIProvider:
                 provider=self.name,
                 model=request.model,
                 content=text_from(item),
+                tool_calls=tool_calls_from(item),
             )
 
     def _kwargs(self, request: ChatRequest) -> dict[str, Any]:

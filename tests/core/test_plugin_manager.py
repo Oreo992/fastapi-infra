@@ -84,6 +84,18 @@ class StartupFailingPlugin(FakePlugin):
         raise RuntimeError("startup failed")
 
 
+class RegisterThenStartupFailingPlugin(FakePlugin):
+    metadata = PluginMetadata(name="register_then_startup_failing", version="1.0.0")
+
+    def register(self, ctx: PluginContext) -> None:
+        self.events.append("register")
+        ctx.services["leaky"] = self
+
+    async def startup(self, ctx: PluginContext) -> None:
+        self.events.append("startup")
+        raise RuntimeError("startup failed")
+
+
 class UnhealthyPlugin(FakePlugin):
     metadata = PluginMetadata(name="unhealthy", version="1.0.0")
 
@@ -252,6 +264,22 @@ async def test_startup_failure_rolls_back_already_started_plugins():
 
     assert fake.events == ["register", "startup", "shutdown"]
     assert failing.events == ["register", "startup"]
+
+
+@pytest.mark.asyncio
+async def test_current_plugin_startup_failure_does_not_leak_services_or_context():
+    settings = InfraSettings(
+        infra={"plugins": {"register_then_startup_failing": {"enabled": True}}}
+    )
+    plugin = RegisterThenStartupFailingPlugin()
+    manager = PluginManager(settings=settings, plugins=[plugin])
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        await manager.startup()
+
+    assert plugin.events == ["register", "startup"]
+    assert manager.get("leaky", default=None) is None
+    assert "register_then_startup_failing" not in manager._contexts
 
 
 @pytest.mark.asyncio

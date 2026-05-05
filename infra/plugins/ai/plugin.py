@@ -1,13 +1,18 @@
+from typing import Literal
+
 from pydantic import BaseModel
 
 from infra.core.health import HealthState
+from infra.plugins.ai.adapters.anthropic import AnthropicAIProvider
+from infra.plugins.ai.adapters.gemini import GeminiAIProvider
+from infra.plugins.ai.adapters.openai import OpenAIProvider
 from infra.plugins.ai.providers.mock import MockAIProvider
 from infra.plugins.ai.registry import AIRegistry
 from infra.plugins.contract import PluginContext, PluginMetadata
 
 
 class AIPluginConfig(BaseModel):
-    default_provider: str = "mock"
+    default_provider: Literal["mock", "openai", "anthropic", "gemini"] = "mock"
 
 
 class AIPlugin:
@@ -22,7 +27,14 @@ class AIPlugin:
     def register(self, ctx: PluginContext) -> None:
         config = ctx.config if isinstance(ctx.config, AIPluginConfig) else AIPluginConfig()
         registry = AIRegistry(default_provider=config.default_provider)
-        registry.register(MockAIProvider(), default=config.default_provider == "mock")
+        providers = [
+            MockAIProvider(),
+            OpenAIProvider(),
+            AnthropicAIProvider(),
+            GeminiAIProvider(),
+        ]
+        for provider in providers:
+            registry.register(provider, default=provider.name == config.default_provider)
         ctx.services["ai"] = registry
 
     async def startup(self, ctx: PluginContext) -> None:

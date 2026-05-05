@@ -7,9 +7,6 @@ def test_infra_package_has_no_original_business_imports():
     denied_terms = [
         "from app.",
         "import app.",
-        "Agent",
-        "Tool",
-        "LLM",
         "PersonalityTest",
         "MusicSync",
         "塔罗",

@@ -30,6 +30,10 @@ class PluginManager:
         return self.services.get(name, default)
 
     async def startup(self) -> None:
+        services_before_startup = dict(self.services)
+        contexts_before_startup = dict(self._contexts)
+        started_before_startup = list(self.started_plugins)
+        active_before_startup = set(self.active_plugins)
         try:
             for name in self._resolve_order():
                 plugin = self.plugins[name]
@@ -104,27 +108,31 @@ class PluginManager:
                 ctx = PluginContext(
                     settings=self.settings,
                     plugin_settings=plugin_settings,
-                    services=self.services,
+                    services=dict(self.services),
                     health=self.health,
                     config=config,
                 )
                 self._contexts[name] = ctx
                 plugin.register(ctx)
-                self.services.update(ctx.services)
                 await plugin.startup(ctx)
-                self.services.update(ctx.services)
                 self.started_plugins.append(name)
                 self.active_plugins.add(name)
                 health_status = await plugin.health_check(ctx)
                 self.health.set_status(health_status)
                 if health_status.status is HealthState.UNHEALTHY:
                     raise PluginDependencyError(f"plugin is unhealthy: {name}")
+                self.services.clear()
                 self.services.update(ctx.services)
         except Exception:
             try:
                 await self.shutdown()
             except Exception:
                 pass
+            self.services.clear()
+            self.services.update(services_before_startup)
+            self._contexts = contexts_before_startup
+            self.started_plugins = started_before_startup
+            self.active_plugins = active_before_startup
             raise
 
     async def shutdown(self) -> None:
