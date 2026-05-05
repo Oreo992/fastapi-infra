@@ -1,0 +1,30 @@
+# ============================================
+# FastAPI Infrastructure - Core Dependencies
+# ============================================
+
+# Web Framework
+fastapi==0.117.1
+uvicorn[standard]==0.37.0
+starlette==0.48.0
+uvloop==0.21.0; platform_system != "Windows"
+
+# Data Validation
+pydantic==2.11.9
+pydantic-settings==2.10.1
+
+# Database
+aiomysql==0.2.0
+redis==6.4.0
+
+# HTTP Client
+aiohttp==3.12.15
+httpx==0.25.2
+
+# Serialization
+orjson==3.10.7
+
+# Logging
+loguru==0.7.3
+
+# System
+psutil==7.1.0
