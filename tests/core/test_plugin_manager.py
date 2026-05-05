@@ -60,6 +60,15 @@ class DependsOnMissingPlugin(FakePlugin):
     )
 
 
+class DependsOnAbsentPlugin(FakePlugin):
+    metadata = PluginMetadata(
+        name="depends_on_absent",
+        version="1.0.0",
+        dependencies=["absent"],
+        provides=["depends_on_absent"],
+    )
+
+
 class HealthFailingPlugin(FakePlugin):
     metadata = PluginMetadata(name="health_failing", version="1.0.0")
 
@@ -281,6 +290,52 @@ async def test_auto_plugin_is_disabled_when_required_dependency_is_auto_skipped(
     assert dependent.events == []
     assert snapshot["depends_on_missing"].status is HealthState.DISABLED
     assert snapshot["depends_on_missing"].details == {"inactive_dependencies": ["missing"]}
+
+
+@pytest.mark.asyncio
+async def test_forced_plugin_fails_when_required_dependency_is_unknown():
+    settings = InfraSettings(
+        infra={"plugins": {"depends_on_absent": {"enabled": True}}}
+    )
+    plugin = DependsOnAbsentPlugin()
+    manager = PluginManager(settings=settings, plugins=[plugin])
+
+    with pytest.raises(PluginDependencyError, match="unknown required dependency"):
+        await manager.startup()
+
+    assert plugin.events == []
+
+
+@pytest.mark.asyncio
+async def test_auto_plugin_is_disabled_when_required_dependency_is_unknown():
+    settings = InfraSettings(
+        infra={"plugins": {"depends_on_absent": {"enabled": None}}}
+    )
+    plugin = DependsOnAbsentPlugin()
+    manager = PluginManager(settings=settings, plugins=[plugin])
+
+    await manager.startup()
+
+    snapshot = manager.health.snapshot()
+    assert plugin.events == []
+    assert snapshot["depends_on_absent"].status is HealthState.DISABLED
+    assert snapshot["depends_on_absent"].details == {"missing_dependencies": ["absent"]}
+
+
+@pytest.mark.asyncio
+async def test_disabled_plugin_with_unknown_required_dependency_is_skipped():
+    settings = InfraSettings(
+        infra={"plugins": {"depends_on_absent": {"enabled": False}}}
+    )
+    plugin = DependsOnAbsentPlugin()
+    manager = PluginManager(settings=settings, plugins=[plugin])
+
+    await manager.startup()
+
+    snapshot = manager.health.snapshot()
+    assert plugin.events == []
+    assert snapshot["depends_on_absent"].status is HealthState.DISABLED
+    assert snapshot["depends_on_absent"].message == "disabled by config"
 
 
 def test_duplicate_plugin_names_raise_dependency_error():

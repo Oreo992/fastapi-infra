@@ -40,6 +40,25 @@ class PluginManager:
                     self._set_disabled(name, "disabled by config")
                     continue
 
+                missing_dependencies = [
+                    dependency
+                    for dependency in plugin.metadata.dependencies
+                    if dependency not in self.plugins
+                ]
+                if missing_dependencies:
+                    message = (
+                        "unknown required dependency: "
+                        f"{', '.join(missing_dependencies)}"
+                    )
+                    if enabled is True:
+                        raise PluginDependencyError(message)
+                    self._set_disabled(
+                        name,
+                        message,
+                        details={"missing_dependencies": missing_dependencies},
+                    )
+                    continue
+
                 inactive_dependencies = [
                     dependency
                     for dependency in plugin.metadata.dependencies
@@ -114,9 +133,8 @@ class PluginManager:
 
             visiting.add(name)
             for dependency in plugin.metadata.dependencies:
-                if dependency not in self.plugins:
-                    raise PluginDependencyError(f"unknown plugin dependency: {dependency}")
-                visit(dependency)
+                if dependency in self.plugins:
+                    visit(dependency)
             visiting.remove(name)
             visited.add(name)
             resolved.append(name)
