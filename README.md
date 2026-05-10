@@ -37,6 +37,7 @@ async def health():
 默认内置插件都是内存安全或 mock 实现，可以直接启动：
 
 - `ai`
+- `speech`
 - `auth`
 - `observability`
 - `tasks`
@@ -90,6 +91,21 @@ settings = InfraSettings(
 - `False`: 明确关闭，插件不会注册服务。
 - `None`: 自动模式，适合可选依赖和默认能力。
 
+也可以从 JSON/TOML 文件和环境变量加载配置：
+
+```python
+from infra.config import load_infra_settings
+
+settings = load_infra_settings("infra.toml")
+```
+
+环境变量使用双下划线路径，并覆盖文件配置：
+
+```bash
+INFRA__INFRA__PLUGINS__PAYMENT__ENABLED=false
+INFRA__INFRA__PLUGINS__AUTH__CONFIG__JWT_SECRET=change-me
+```
+
 ## AI
 
 AI 插件默认使用 mock provider，适合测试和本地开发：
@@ -105,6 +121,16 @@ SDK adapter 已提供 OpenAI、Anthropic、Gemini 的统一表层，按需安装
 pip install -e ".[ai-openai]"
 pip install -e ".[ai-anthropic]"
 pip install -e ".[ai-gemini]"
+```
+
+## 语音
+
+`speech` 插件提供 ASR/TTS 的 provider 架构，默认 mock provider 不依赖外部 SDK：
+
+```python
+speech = infra.get("speech")
+transcription = await speech.transcribe(b"audio")
+synthesis = await speech.synthesize("hello")
 ```
 
 ## 认证
@@ -181,6 +207,20 @@ settings = InfraSettings(
 
 Redis adapter 会创建 consumer group，空队列时非阻塞返回 `None`，并优先恢复
 超过 `pending_min_idle_ms` 的 pending 任务。
+
+## 项目脚手架
+
+需要快速开一个业务项目时，可以用内置脚手架生成最小 FastAPI app：
+
+```python
+from infra.scaffold import create_project
+
+create_project(
+    "services/billing-api",
+    "billing_api",
+    enabled_plugins=("auth", "payment", "tasks", "observability"),
+)
+```
 
 ## 文档和示例
 

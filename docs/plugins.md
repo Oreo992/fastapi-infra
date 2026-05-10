@@ -45,6 +45,37 @@ Flag behavior:
 - `enabled=False`: skip plugin registration and mark health as disabled.
 - `enabled=None`: auto mode; invalid optional setup disables the plugin instead of failing the app.
 
+## Settings Loading
+
+`load_infra_settings()` is exported from `infra.config` for apps that want file
+and environment based configuration without importing extra packages:
+
+```python
+from infra.config import load_infra_settings
+
+settings = load_infra_settings("infra.toml")
+```
+
+JSON and TOML files map directly to `InfraSettings`:
+
+```toml
+[infra.plugins.payment]
+enabled = false
+
+[infra.plugins.auth.config]
+jwt_secret = "change-me"
+```
+
+Environment variables use double-underscore paths and override file values:
+
+```bash
+INFRA__INFRA__PLUGINS__PAYMENT__ENABLED=false
+INFRA__INFRA__PLUGINS__AUTH__CONFIG__JWT_SECRET=change-me
+```
+
+Values are parsed as JSON when possible, so `true`, `false`, `null`, numbers,
+arrays, and objects keep their structured types.
+
 ## Services
 
 Plugins write services to `ctx.services` during `register()`.
@@ -165,6 +196,37 @@ status = await payment.get_payment_status(checkout.id)
 
 Provider names are validated during plugin startup. Real payment channels can be
 added as new providers without changing application call sites.
+
+## Speech
+
+The speech plugin registers a `SpeechService` for ASR and TTS. It follows the
+same provider-registry shape as payment and AI. The built-in `mock` provider is
+safe for local development and tests.
+
+```python
+settings = InfraSettings(
+    infra={
+        "plugins": {
+            "speech": {
+                "enabled": True,
+                "config": {
+                    "default_provider": "mock",
+                    "providers": {"mock": {}},
+                },
+            }
+        }
+    }
+)
+```
+
+```python
+speech = infra.get("speech")
+transcription = await speech.transcribe(b"audio", format="wav")
+synthesis = await speech.synthesize("hello", voice="default")
+```
+
+External ASR/TTS vendors should be added as providers behind this service
+interface, not called directly from application routes.
 
 ## Tasks
 

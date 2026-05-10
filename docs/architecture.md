@@ -26,11 +26,11 @@ The core does not know application business concepts. It only manages:
 
 ## Plugins
 
-Plugins provide optional capabilities such as AI, auth, database, cache, HTTP,
-tasks, storage, payment, notifications, webhooks, rate limiting, and
-observability. Provider-backed plugins, such as AI and payment, expose a stable
-service while letting individual providers remain replaceable behind the plugin
-boundary.
+Plugins provide optional capabilities such as AI, speech, auth, database, cache,
+HTTP, tasks, storage, payment, notifications, webhooks, rate limiting, and
+observability. Provider-backed plugins, such as AI, speech, and payment, expose a
+stable service while letting individual providers remain replaceable behind the
+plugin boundary.
 
 Each plugin owns its implementation and registers one or more named services into
 the plugin context. Failed startup rolls back service state so partially

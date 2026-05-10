@@ -25,10 +25,14 @@ def test_importing_infra_has_no_legacy_settings_side_effects():
     assert result.stderr == ""
 
 
-def test_config_public_api_exposes_only_new_settings_models():
+def test_config_public_api_exposes_new_settings_helpers():
     import infra.config as config
 
-    assert sorted(config.__all__) == ["InfraSettings", "PluginSettings"]
+    assert sorted(config.__all__) == [
+        "InfraSettings",
+        "PluginSettings",
+        "load_infra_settings",
+    ]
     assert not hasattr(config, "BaseSettings")
     assert not hasattr(config, "get_platform_env_file")
 

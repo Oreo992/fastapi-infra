@@ -10,6 +10,7 @@ def test_builtin_plugins_include_first_batch_plugin_names():
 
     assert names == [
         "ai",
+        "speech",
         "auth",
         "database",
         "cache",
@@ -33,6 +34,7 @@ async def test_builtin_plugins_start_memory_safe_services_by_default():
 
     for service_name in [
         "ai",
+        "speech",
         "auth",
         "observability",
         "tasks",
