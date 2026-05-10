@@ -89,8 +89,82 @@ settings = InfraSettings(
 ```
 
 Forced backend plugins fail fast when required optional packages are missing.
-The cache plugin owns the Redis manager created by `CacheService` and closes it
-during plugin shutdown.
+The cache plugin uses the configured `database_service` when it exists. If no
+database service is active, it creates its own `DatabaseManager` from
+`database_config` and closes only that owned manager during plugin shutdown.
+Lower-level database consumers such as repositories, unit-of-work, distributed
+locks, and streams require an explicit `DatabaseManager` argument; they do not
+create unmanaged default connections.
+
+## Auth
+
+The auth plugin provides API-key authentication plus stdlib HS256 JWT issuing
+and verification. Configure API keys and JWT settings under the plugin config:
+
+```python
+settings = InfraSettings(
+    infra={
+        "plugins": {
+            "auth": {
+                "enabled": True,
+                "config": {
+                    "api_keys": {
+                        "secret": {
+                            "subject": "user-1",
+                            "scopes": ["read:items"],
+                            "roles": ["admin"],
+                        }
+                    },
+                    "jwt_secret": "change-me",
+                    "jwt_issuer": "fastapi-infra",
+                    "jwt_audience": "api",
+                    "access_token_ttl_seconds": 3600,
+                },
+            }
+        }
+    }
+)
+```
+
+`jwt_secret` is required for `issue_jwt()`, `authenticate_jwt()`, and
+`authenticate_bearer()`. Issuer and audience are optional, but when configured
+they are required on incoming JWTs.
+
+## Payment
+
+The payment plugin registers a `PaymentService` backed by a provider registry.
+The built-in `mock` provider is deterministic and safe for local development.
+
+```python
+settings = InfraSettings(
+    infra={
+        "plugins": {
+            "payment": {
+                "enabled": True,
+                "config": {
+                    "default_provider": "mock",
+                    "providers": {"mock": {}},
+                },
+            }
+        }
+    }
+)
+```
+
+Business code calls the service, not a provider directly:
+
+```python
+payment = infra.get("payment")
+checkout = await payment.create_checkout(
+    amount=1250,
+    currency="usd",
+    reference="order-123",
+)
+status = await payment.get_payment_status(checkout.id)
+```
+
+Provider names are validated during plugin startup. Real payment channels can be
+added as new providers without changing application call sites.
 
 ## Tasks
 

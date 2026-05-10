@@ -1,7 +1,7 @@
 """
 数据库配置和连接管理
 
-高性能异步数据库管理，使用aiomysql + Redis，单例模式确保高并发安全
+高性能异步数据库管理，使用aiomysql + Redis
 """
 
 import asyncio
@@ -19,7 +19,7 @@ logger = get_logger(__name__)
 
 
 class DatabaseManager:
-    """高性能数据库管理器 - 单例模式，基于aiomysql + Redis
+    """高性能数据库管理器，基于aiomysql + Redis
     
     使用方式：
         config = {
@@ -35,25 +35,14 @@ class DatabaseManager:
         await db.initialize()
     """
 
-    _instance = None
-    _lock = threading.Lock()
-
-    def __new__(cls, config: dict = None):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-        return cls._instance
-
     def __init__(self, config: dict = None):
-        if not hasattr(self, "_initialized"):
-            self._config = config or {}
-            self._mysql_pool: aiomysql.Pool | None = None
-            # 支持多事件循环：为每个事件循环维护独立的Redis客户端
-            self._redis_clients: dict[int, redis.Redis] = {}
-            self._redis_lock = threading.Lock()
-            self._initialized = False
-            self._init_lock = asyncio.Lock()
+        self._config = config or {}
+        self._mysql_pool: aiomysql.Pool | None = None
+        # 支持多事件循环：为每个事件循环维护独立的Redis客户端
+        self._redis_clients: dict[int, redis.Redis] = {}
+        self._redis_lock = threading.Lock()
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     async def initialize(self):
         """初始化数据库连接"""

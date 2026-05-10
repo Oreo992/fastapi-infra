@@ -4,7 +4,13 @@ from infra.config.models import InfraSettings
 from infra.core.health import HealthState
 from infra.plugins.manager import PluginManager
 from infra.plugins.notifications import NoopNotificationService, NotificationsPlugin
-from infra.plugins.payment import MockPaymentService, PaymentPlugin
+from infra.plugins.payment import (
+    MockPaymentProvider,
+    PaymentCheckout,
+    PaymentPlugin,
+    PaymentProviderRegistry,
+    PaymentService,
+)
 from infra.plugins.ratelimit import MemoryRateLimiter, RateLimitPlugin
 from infra.plugins.storage import LocalStorage, StoragePlugin
 from infra.plugins.webhooks import WebhookDispatcher, WebhooksPlugin
@@ -46,8 +52,10 @@ async def test_webhook_dispatcher_invokes_registered_async_handlers():
 
 
 @pytest.mark.asyncio
-async def test_mock_payment_service_creates_checkout():
-    service = MockPaymentService()
+async def test_payment_service_creates_default_mock_checkout_and_reads_status():
+    registry = PaymentProviderRegistry(default_provider="mock")
+    registry.register(MockPaymentProvider())
+    service = PaymentService(registry)
 
     checkout = await service.create_checkout(
         amount=1250,
@@ -60,6 +68,71 @@ async def test_mock_payment_service_creates_checkout():
     assert checkout.reference == "order-123"
     assert checkout.status == "pending"
     assert checkout.url.endswith(checkout.id)
+
+    status = await service.get_payment_status(checkout.id)
+
+    assert status == "pending"
+
+
+class CustomPaymentProvider:
+    name = "custom"
+
+    async def create_checkout(
+        self,
+        amount: int,
+        currency: str,
+        reference: str | None = None,
+    ) -> PaymentCheckout:
+        return PaymentCheckout(
+            id="custom-checkout",
+            amount=amount,
+            currency=currency.lower(),
+            reference=reference,
+            status="custom-pending",
+            url="custom://checkout/custom-checkout",
+        )
+
+    async def get_payment_status(self, checkout_id: str) -> str:
+        return f"custom-status:{checkout_id}"
+
+
+@pytest.mark.asyncio
+async def test_payment_service_supports_provider_override():
+    registry = PaymentProviderRegistry(default_provider="mock")
+    registry.register(CustomPaymentProvider())
+    service = PaymentService(registry)
+
+    checkout = await service.create_checkout(
+        amount=500,
+        currency="USD",
+        provider="custom",
+    )
+    status = await service.get_payment_status(checkout.id, provider="custom")
+
+    assert checkout.id == "custom-checkout"
+    assert checkout.currency == "usd"
+    assert status == "custom-status:custom-checkout"
+
+
+@pytest.mark.asyncio
+async def test_payment_plugin_rejects_unknown_provider_config_through_manager():
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "payment": {
+                    "enabled": True,
+                    "config": {
+                        "default_provider": "stripe",
+                        "providers": {"stripe": {}},
+                    },
+                }
+            }
+        }
+    )
+    manager = PluginManager(settings=settings, plugins=[PaymentPlugin()])
+
+    with pytest.raises(ValueError, match="unknown payment provider"):
+        await manager.startup()
 
 
 @pytest.mark.asyncio
@@ -120,7 +193,7 @@ async def test_peripheral_plugins_register_services_through_plugin_manager(tmp_p
 
     assert isinstance(manager.get("storage"), LocalStorage)
     assert isinstance(manager.get("webhooks"), WebhookDispatcher)
-    assert isinstance(manager.get("payment"), MockPaymentService)
+    assert isinstance(manager.get("payment"), PaymentService)
     assert isinstance(manager.get("ratelimit"), MemoryRateLimiter)
     assert isinstance(manager.get("notifications"), NoopNotificationService)
     assert {

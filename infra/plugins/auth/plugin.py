@@ -8,6 +8,10 @@ from infra.plugins.contract import PluginContext, PluginMetadata
 
 class AuthPluginConfig(BaseModel):
     api_keys: dict[str, ApiKeyRecord] = Field(default_factory=dict)
+    jwt_secret: str | None = None
+    jwt_issuer: str | None = None
+    jwt_audience: str | None = None
+    access_token_ttl_seconds: int = 3600
 
 
 class AuthPlugin:
@@ -20,7 +24,13 @@ class AuthPlugin:
 
     def register(self, ctx: PluginContext) -> None:
         config = ctx.config if isinstance(ctx.config, AuthPluginConfig) else AuthPluginConfig()
-        ctx.services["auth"] = AuthService(api_keys=config.api_keys)
+        ctx.services["auth"] = AuthService(
+            api_keys=config.api_keys,
+            jwt_secret=config.jwt_secret,
+            jwt_issuer=config.jwt_issuer,
+            jwt_audience=config.jwt_audience,
+            access_token_ttl_seconds=config.access_token_ttl_seconds,
+        )
 
     async def startup(self, ctx: PluginContext) -> None:
         return None

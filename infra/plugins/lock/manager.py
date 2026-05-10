@@ -26,14 +26,14 @@ class LockAcquisitionError(Exception):
 class DistributedLockManager:
     """基于Redis的分布式锁管理器"""
 
-    def __init__(self, prefix: str = "lock", db: DatabaseManager | None = None):
+    def __init__(self, db: DatabaseManager, prefix: str = "lock"):
         """初始化锁管理器
 
         Args:
             prefix: 锁key的前缀，用于命名空间隔离
         """
         self.prefix = prefix
-        self._db = db or DatabaseManager()
+        self._db = db
         self._lock_tokens = {}  # {key: token} 记录已获取的锁
 
     def _build_key(self, key: str) -> str:

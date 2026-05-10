@@ -99,6 +99,7 @@ class BaseRepository(IRepository[T]):
         id_field: str = "id",
         created_at_field: str = "created_at",
         updated_at_field: str = "updated_at",
+        db: DatabaseManager,
     ):
         """
         初始化 Repository
@@ -112,6 +113,7 @@ class BaseRepository(IRepository[T]):
             id_field: 主键字段名
             created_at_field: 创建时间字段名
             updated_at_field: 更新时间字段名
+            db: 显式传入的数据库管理器
         """
         self.table_name = table_name
         self.soft_delete = soft_delete
@@ -122,7 +124,7 @@ class BaseRepository(IRepository[T]):
         self.created_at_field = created_at_field
         self.updated_at_field = updated_at_field
 
-        self._db = DatabaseManager()
+        self._db = db
 
     # ==================== 连接管理 ====================
 
@@ -647,8 +649,8 @@ class UnitOfWork:
             # 自动提交或回滚
     """
 
-    def __init__(self, db: DatabaseManager | None = None):
-        self._db = db or DatabaseManager()
+    def __init__(self, db: DatabaseManager):
+        self._db = db
         self._connection = None
         self._in_transaction = False
 

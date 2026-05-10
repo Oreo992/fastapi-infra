@@ -1,4 +1,5 @@
 import infra
+import pytest
 import subprocess
 import sys
 
@@ -45,3 +46,26 @@ def test_database_manager_module_has_no_legacy_global_helpers():
         "get_db_session",
     ]:
         assert not hasattr(database_manager, name)
+
+
+def test_database_manager_instances_are_not_process_wide_singletons():
+    from infra.database.manager import DatabaseManager
+
+    first = DatabaseManager({"mysql_host": "db-a"})
+    second = DatabaseManager({"mysql_host": "db-b"})
+
+    assert first is not second
+
+
+def test_database_consumers_require_explicit_database_manager():
+    from infra.database.repository import UnitOfWork
+    from infra.plugins.lock.manager import DistributedLockManager
+    from infra.streaming.streams_manager import StreamConfig, StreamsManager
+
+    for factory in [
+        UnitOfWork,
+        DistributedLockManager,
+        lambda: StreamsManager(StreamConfig(stream_name="events")),
+    ]:
+        with pytest.raises(TypeError):
+            factory()

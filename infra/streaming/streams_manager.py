@@ -111,7 +111,7 @@ class StreamsManager:
     - Pending 消息恢复
     """
 
-    def __init__(self, config: StreamConfig):
+    def __init__(self, config: StreamConfig, db_manager: DatabaseManager):
         """
         初始化 Streams 管理器
 
@@ -123,7 +123,7 @@ class StreamsManager:
         self._initialized = False
         self._running = False
         self._consumer_task: asyncio.Task | None = None
-        self._db_manager: DatabaseManager | None = None
+        self._db_manager = db_manager
 
     async def _get_redis_client(self):
         """
@@ -131,9 +131,7 @@ class StreamsManager:
 
         避免在多事件循环环境下出现"Future attached to a different loop"错误
         """
-        if self._db_manager is None:
-            self._db_manager = DatabaseManager()
-            await self._db_manager.initialize()
+        await self._db_manager.initialize()
         return await self._db_manager._get_or_create_redis_client()
 
     async def initialize(self):

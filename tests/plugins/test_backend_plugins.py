@@ -46,16 +46,17 @@ async def test_enabled_backend_plugins_register_fake_services(monkeypatch):
             self.closed = True
 
     class FakeCacheDatabaseManager:
-        def __init__(self):
+        def __init__(self, config=None):
+            self.config = config or {}
             self.closed = False
 
         async def close(self):
             self.closed = True
 
     class FakeCacheService:
-        def __init__(self, namespace=""):
+        def __init__(self, namespace="", db_manager=None):
             self.namespace = namespace
-            self._db_manager = FakeCacheDatabaseManager()
+            self._db_manager = db_manager
 
     class FakeHttpClient:
         def __init__(self, base_url="", timeout=30.0, headers=None):
@@ -77,6 +78,11 @@ async def test_enabled_backend_plugins_register_fake_services(monkeypatch):
         database_plugin,
         "_load_database_manager",
         lambda: FakeDatabaseManager,
+    )
+    monkeypatch.setattr(
+        cache_plugin,
+        "_load_database_manager",
+        lambda: FakeCacheDatabaseManager,
     )
     monkeypatch.setattr(cache_plugin, "_load_cache_service", lambda: FakeCacheService)
     monkeypatch.setattr(http_plugin, "_load_http_client", lambda: FakeHttpClient)
@@ -119,6 +125,7 @@ async def test_enabled_backend_plugins_register_fake_services(monkeypatch):
     assert database.initialized is True
     assert isinstance(cache, FakeCacheService)
     assert cache.namespace == "tenant-a"
+    assert cache._db_manager is database
     assert isinstance(http, FakeHttpClient)
     assert http.base_url == "https://api.example.test"
     assert http.timeout == 3.5
@@ -127,8 +134,129 @@ async def test_enabled_backend_plugins_register_fake_services(monkeypatch):
     await manager.shutdown()
 
     assert database.closed is True
-    assert cache._db_manager.closed is True
     assert http.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cache_plugin_creates_and_closes_owned_database_when_service_missing(monkeypatch):
+    from infra.plugins.cache import plugin as cache_plugin
+
+    owned_managers = []
+
+    class FakeDatabaseManager:
+        def __init__(self, config):
+            self.config = config
+            self.closed = False
+            owned_managers.append(self)
+
+        async def close(self):
+            self.closed = True
+
+    class FakeCacheService:
+        def __init__(self, namespace="", db_manager=None):
+            self.namespace = namespace
+            self._db_manager = db_manager
+
+    def fake_find_spec(name):
+        if name in {"aiomysql", "redis", "orjson"}:
+            return object()
+        return importlib.util.find_spec(name)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.setattr(
+        cache_plugin,
+        "_load_database_manager",
+        lambda: FakeDatabaseManager,
+    )
+    monkeypatch.setattr(cache_plugin, "_load_cache_service", lambda: FakeCacheService)
+
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "cache": {
+                    "enabled": True,
+                    "config": {
+                        "namespace": "tenant-b",
+                        "database_config": {"redis_url": "redis://cache-only/0"},
+                    },
+                },
+            }
+        }
+    )
+    manager = PluginManager(settings=settings, plugins=[cache_plugin.CachePlugin()])
+
+    await manager.startup()
+
+    cache = manager.get("cache")
+
+    assert isinstance(cache, FakeCacheService)
+    assert cache.namespace == "tenant-b"
+    assert cache._db_manager is owned_managers[0]
+    assert owned_managers[0].config == {"redis_url": "redis://cache-only/0"}
+
+    await manager.shutdown()
+
+    assert owned_managers[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_cache_plugin_does_not_close_shared_database_service(monkeypatch):
+    from infra.plugins.cache import plugin as cache_plugin
+    from infra.plugins.database import plugin as database_plugin
+
+    class FakeDatabaseManager:
+        def __init__(self, config):
+            self.config = config
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+
+    class FakeCacheService:
+        def __init__(self, namespace="", db_manager=None):
+            self.namespace = namespace
+            self._db_manager = db_manager
+
+    def fake_find_spec(name):
+        if name in {"aiomysql", "redis", "orjson"}:
+            return object()
+        return importlib.util.find_spec(name)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.setattr(
+        database_plugin,
+        "_load_database_manager",
+        lambda: FakeDatabaseManager,
+    )
+    monkeypatch.setattr(cache_plugin, "_load_cache_service", lambda: FakeCacheService)
+
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "database": {"enabled": True},
+                "cache": {"enabled": True},
+            }
+        }
+    )
+    manager = PluginManager(
+        settings=settings,
+        plugins=[database_plugin.DatabasePlugin(), cache_plugin.CachePlugin()],
+    )
+
+    await manager.startup()
+
+    database = manager.get("database")
+    cache = manager.get("cache")
+
+    assert cache._db_manager is database
+
+    await manager.plugins["cache"].shutdown(manager._contexts["cache"])
+
+    assert database.close_calls == 0
+
+    await manager.shutdown()
+
+    assert database.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -159,3 +287,10 @@ async def test_enabled_cache_plugin_requires_service_import_dependencies(monkeyp
 
     for dependency in expected_dependencies:
         assert dependency in str(exc.value)
+
+
+def test_cache_service_requires_explicit_database_manager():
+    from infra.cache.service import CacheService
+
+    with pytest.raises(TypeError):
+        CacheService()

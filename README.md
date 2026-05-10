@@ -107,6 +107,54 @@ pip install -e ".[ai-anthropic]"
 pip install -e ".[ai-gemini]"
 ```
 
+## 认证
+
+`auth` 插件支持 API key、HS256 JWT 和基础 RBAC：
+
+```python
+settings = InfraSettings(
+    infra={
+        "plugins": {
+            "auth": {
+                "enabled": True,
+                "config": {
+                    "jwt_secret": "change-me",
+                    "api_keys": {
+                        "dev-key": {
+                            "subject": "developer",
+                            "scopes": ["checkout:create"],
+                            "roles": ["admin"],
+                        }
+                    },
+                },
+            }
+        }
+    }
+)
+```
+
+```python
+auth = infra.get("auth")
+token = auth.issue_jwt("user-1", scopes={"read:items"}, roles={"member"})
+principal = auth.authenticate_bearer(f"Bearer {token}")
+auth.require_roles(principal, ["member"])
+```
+
+## 支付
+
+`payment` 插件现在注册 `PaymentService`，底层通过 provider registry 分发。
+默认内置 `mock` provider，真实 Stripe/PayPal 等渠道后续可作为 provider 接入：
+
+```python
+payment = infra.get("payment")
+checkout = await payment.create_checkout(
+    amount=1250,
+    currency="usd",
+    reference="order-123",
+)
+status = await payment.get_payment_status(checkout.id)
+```
+
 ## Redis 任务队列
 
 `tasks` 默认是内存队列。需要跨进程任务分发时可以切换到 Redis Streams：

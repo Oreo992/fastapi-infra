@@ -19,7 +19,7 @@ class CacheService:
     
     使用示例:
         # 创建缓存服务（可选命名空间隔离）
-        cache = CacheService(namespace="my_feature")
+        cache = CacheService(namespace="my_feature", db_manager=db_manager)
         
         # 设置缓存（默认 1 小时）
         await cache.set("key", {"data": "value"})
@@ -34,15 +34,15 @@ class CacheService:
         await cache.delete("key")
     """
 
-    def __init__(self, namespace: str = "", db_manager: DatabaseManager = None):
+    def __init__(self, namespace: str, db_manager: DatabaseManager):
         """初始化缓存服务
         
         Args:
             namespace: 命名空间，用于键前缀隔离
-            db_manager: DatabaseManager 实例，如果不提供则使用全局单例
+            db_manager: DatabaseManager 实例，由调用方或插件显式管理
         """
         self.namespace = namespace
-        self._db_manager = db_manager or DatabaseManager()
+        self._db_manager = db_manager
 
     def _make_key(self, key: str) -> str:
         """生成带命名空间的键"""
