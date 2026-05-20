@@ -1,7 +1,13 @@
 from fastapi import FastAPI, Header
 
 from infra import InfraSettings, setup_infra
-
+from infra.plugins import (
+    AUTH_SERVICE,
+    NOTIFICATIONS_SERVICE,
+    PAYMENT_SERVICE,
+    TASKS_SERVICE,
+)
+from infra.plugins.auth import hash_api_key
 
 settings = InfraSettings(
     infra={
@@ -9,8 +15,9 @@ settings = InfraSettings(
             "auth": {
                 "enabled": True,
                 "config": {
-                    "api_keys": {
+                    "hashed_api_keys": {
                         "dev-key": {
+                            "key_hash": hash_api_key("dev-key", salt=b"fastapi-infra-example"),
                             "subject": "developer",
                             "scopes": ["checkout:create", "tasks:create"],
                         }
@@ -30,11 +37,11 @@ infra = setup_infra(app, settings)
 
 @app.post("/checkout")
 async def checkout(payload: dict, x_api_key: str | None = Header(default=None)):
-    auth = infra.get("auth")
+    auth = infra.require(AUTH_SERVICE)
     principal = auth.authenticate_api_key(x_api_key)
     auth.require_scopes(principal, ["checkout:create"])
 
-    payment = infra.get("payment")
+    payment = infra.require(PAYMENT_SERVICE)
     checkout_result = await payment.create_checkout(
         amount=int(payload["amount"]),
         currency=payload.get("currency", "usd"),
@@ -45,18 +52,18 @@ async def checkout(payload: dict, x_api_key: str | None = Header(default=None)):
 
 @app.post("/tasks")
 async def create_task(payload: dict, x_api_key: str | None = Header(default=None)):
-    auth = infra.get("auth")
+    auth = infra.require(AUTH_SERVICE)
     principal = auth.authenticate_api_key(x_api_key)
     auth.require_scopes(principal, ["tasks:create"])
 
-    tasks = infra.get("tasks")
+    tasks = infra.require(TASKS_SERVICE)
     task = await tasks.enqueue(payload["name"], payload.get("payload"))
     return task.model_dump()
 
 
 @app.post("/notify")
 async def notify(payload: dict):
-    notifications = infra.get("notifications")
+    notifications = infra.require(NOTIFICATIONS_SERVICE)
     result = await notifications.send(
         channel=payload.get("channel", "email"),
         recipient=payload["recipient"],

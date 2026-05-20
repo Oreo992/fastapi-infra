@@ -90,6 +90,54 @@ def test_health_registry_snapshot_returns_independent_status_models():
     assert second_snapshot["ai"].details == {"checks": {"database": "ok"}}
 
 
+def test_health_status_redacts_secret_values_from_messages_and_details():
+    status = HealthStatus(
+        name="provider",
+        status=HealthState.UNHEALTHY,
+        message="probe failed api_key=sk_live_123 Authorization: Bearer token-123",
+        details={
+            "api_key": "sk_live_123",
+            "password": "secret-password",
+            "nested": {
+                "secret_access_key": "aws-secret",
+                "host": "smtp.example.test",
+            },
+            "items": [{"token": "token-123"}],
+            "account_id": "acct_123",
+        },
+    )
+
+    assert "sk_live_123" not in status.message
+    assert "token-123" not in status.message
+    assert status.details == {
+        "api_key": "[redacted]",
+        "password": "[redacted]",
+        "nested": {
+            "secret_access_key": "[redacted]",
+            "host": "smtp.example.test",
+        },
+        "items": [{"token": "[redacted]"}],
+        "account_id": "acct_123",
+    }
+
+
+def test_health_status_redacts_python_and_json_style_secret_assignments():
+    status = HealthStatus(
+        name="provider",
+        status=HealthState.UNHEALTHY,
+        message=(
+            "input_value={'api_key': 'sk_live_123', "
+            '"password": "secret-password", token=token-123}'
+        ),
+    )
+
+    assert "sk_live_123" not in status.message
+    assert "secret-password" not in status.message
+    assert "token-123" not in status.message
+    assert "'api_key': '[redacted]'" in status.message
+    assert '"password": "[redacted]"' in status.message
+
+
 def test_public_exports_include_settings_flags_and_health_models():
     from infra.config import InfraSettings as ExportedInfraSettings
     from infra.config import PluginSettings as ExportedPluginSettings

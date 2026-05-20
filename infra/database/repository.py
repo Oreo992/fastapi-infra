@@ -16,21 +16,22 @@ import json
 import uuid
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
-import aiomysql
-
+from infra.database.manager import DatabaseManager, _load_aiomysql
 from infra.exceptions import AppException
-from infra.database.manager import DatabaseManager
 from infra.http.resilience import PresetConfigs, with_resilience
 from infra.logging import get_logger
 from infra.utils.timezone import get_timestamp
-
 
 logger = get_logger(__name__)
 
 # 泛型类型
 T = TypeVar("T")
+
+
+def _dict_cursor() -> Any:
+    return _load_aiomysql().DictCursor
 
 
 class IRepository(ABC, Generic[T]):
@@ -137,9 +138,7 @@ class BaseRepository(IRepository[T]):
 
     # ==================== 基础 CRUD 操作 ====================
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         """
         根据 ID 获取单个实体
@@ -153,12 +152,12 @@ class BaseRepository(IRepository[T]):
         where_clause = f"{self.id_field} = %s"
         if self.soft_delete:
             where_clause += f" AND {self.soft_delete_field} = %s"
-            params = (id, self.active_value)
+            params: tuple[Any, ...] = (id, self.active_value)
         else:
             params = (id,)
 
         async with self.get_connection() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cursor:
+            async with conn.cursor(_dict_cursor()) as cursor:
                 sql = f"SELECT * FROM {self.table_name} WHERE {where_clause}"
                 await cursor.execute(sql, params)
                 result = await cursor.fetchone()
@@ -167,9 +166,7 @@ class BaseRepository(IRepository[T]):
                     return self._process_row(dict(result))
                 return None
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def create(self, data: dict[str, Any]) -> dict[str, Any]:
         """
         创建实体
@@ -206,9 +203,7 @@ class BaseRepository(IRepository[T]):
             logger.error(f"创建 {self.table_name} 失败: {e}")
             raise self._repository_error("create", e) from e
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def update(self, id: str, data: dict[str, Any]) -> dict[str, Any] | None:
         """
         更新实体
@@ -257,9 +252,7 @@ class BaseRepository(IRepository[T]):
             logger.error(f"更新 {self.table_name} 失败: {e}")
             raise self._repository_error("update", e) from e
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def delete(self, id: str) -> bool:
         """
         删除实体（软删除或硬删除，取决于配置）
@@ -280,14 +273,10 @@ class BaseRepository(IRepository[T]):
                             SET {self.soft_delete_field} = %s, {self.updated_at_field} = %s
                             WHERE {self.id_field} = %s
                         """
-                        await cursor.execute(
-                            sql, (self.soft_delete_value, get_timestamp(), id)
-                        )
+                        await cursor.execute(sql, (self.soft_delete_value, get_timestamp(), id))
                     else:
                         # 硬删除
-                        sql = (
-                            f"DELETE FROM {self.table_name} WHERE {self.id_field} = %s"
-                        )
+                        sql = f"DELETE FROM {self.table_name} WHERE {self.id_field} = %s"
                         await cursor.execute(sql, (id,))
 
                     await conn.commit()
@@ -314,9 +303,7 @@ class BaseRepository(IRepository[T]):
 
     # ==================== 查询方法 ====================
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def get_all(
         self,
         *,
@@ -349,14 +336,12 @@ class BaseRepository(IRepository[T]):
             params.append(self.active_value)
 
         async with self.get_connection() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cursor:
+            async with conn.cursor(_dict_cursor()) as cursor:
                 # 查询总数
-                count_sql = (
-                    f"SELECT COUNT(*) as total FROM {self.table_name} {where_clause}"
-                )
+                count_sql = f"SELECT COUNT(*) as total FROM {self.table_name} {where_clause}"
                 await cursor.execute(count_sql, params if params else None)
                 count_result = await cursor.fetchone()
-                total = count_result["total"] if count_result else 0
+                total = int(count_result["total"]) if count_result else 0
 
                 # 查询数据
                 sql = f"""
@@ -371,9 +356,7 @@ class BaseRepository(IRepository[T]):
                 items = [self._process_row(dict(row)) for row in rows] if rows else []
                 return items, total
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def find_by(
         self,
         conditions: dict[str, Any],
@@ -418,14 +401,12 @@ class BaseRepository(IRepository[T]):
         where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
         async with self.get_connection() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cursor:
+            async with conn.cursor(_dict_cursor()) as cursor:
                 # 查询总数
-                count_sql = (
-                    f"SELECT COUNT(*) as total FROM {self.table_name} {where_clause}"
-                )
+                count_sql = f"SELECT COUNT(*) as total FROM {self.table_name} {where_clause}"
                 await cursor.execute(count_sql, params if params else None)
                 count_result = await cursor.fetchone()
-                total = count_result["total"] if count_result else 0
+                total = int(count_result["total"]) if count_result else 0
 
                 # 查询数据
                 sql = f"""
@@ -440,9 +421,7 @@ class BaseRepository(IRepository[T]):
                 items = [self._process_row(dict(row)) for row in rows] if rows else []
                 return items, total
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def find_one_by(self, conditions: dict[str, Any]) -> dict[str, Any] | None:
         """
         根据条件查询单个实体
@@ -456,9 +435,7 @@ class BaseRepository(IRepository[T]):
         items, _ = await self.find_by(conditions, page=1, page_size=1)
         return items[0] if items else None
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def count(self, conditions: dict[str, Any] | None = None) -> int:
         """
         统计数量
@@ -490,11 +467,9 @@ class BaseRepository(IRepository[T]):
             sql = f"SELECT COUNT(*) FROM {self.table_name} {where_clause}"
             await cursor.execute(sql, params if params else None)
             result = await cursor.fetchone()
-            return result[0] if result else 0
+            return int(result[0]) if result else 0
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def exists(self, id: str) -> bool:
         """
         检查实体是否存在
@@ -507,9 +482,7 @@ class BaseRepository(IRepository[T]):
         """
         return await self.get_by_id(id) is not None
 
-    @with_resilience(
-        timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY
-    )
+    @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def get_by_ids(self, ids: list[str]) -> dict[str, dict[str, Any]]:
         """
         批量获取实体（解决 N+1 查询问题）
@@ -532,7 +505,7 @@ class BaseRepository(IRepository[T]):
             params.append(self.active_value)
 
         async with self.get_connection() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cursor:
+            async with conn.cursor(_dict_cursor()) as cursor:
                 sql = f"SELECT * FROM {self.table_name} WHERE {where_clause}"
                 await cursor.execute(sql, params)
                 rows = await cursor.fetchall()
@@ -541,7 +514,7 @@ class BaseRepository(IRepository[T]):
                 for row in rows or []:
                     entity = self._process_row(dict(row))
                     result[entity[self.id_field]] = entity
-                return result
+                return cast(dict[str, dict[str, Any]], result)
 
     # ==================== 辅助方法 ====================
 
@@ -628,11 +601,11 @@ class BaseRepository(IRepository[T]):
             # 验证是否已经是有效 JSON
             try:
                 json.loads(value)
-                return value
+                return cast(str, value)
             except (json.JSONDecodeError, ValueError):
                 return json.dumps(value, ensure_ascii=False)
 
-        return json.dumps(value, ensure_ascii=False)
+        return cast(str, json.dumps(value, ensure_ascii=False))
 
 
 class UnitOfWork:

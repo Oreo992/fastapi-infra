@@ -1,8 +1,9 @@
-import json
 import inspect
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncIterator, Callable, Sized
 from typing import Any
 
+from infra.core.health import HealthState, HealthStatus
 from infra.plugins.ai.models import ChatMessage, ChatRequest, ToolCall
 
 
@@ -10,6 +11,34 @@ async def maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+async def model_list_health(provider: str, list_models: Callable[[], Any]) -> HealthStatus:
+    details = {"provider": provider}
+    try:
+        response = await maybe_await(list_models())
+    except Exception as exc:
+        return HealthStatus(
+            name=provider,
+            status=HealthState.UNHEALTHY,
+            message=str(exc) or exc.__class__.__name__,
+            details=details,
+        )
+    return HealthStatus(
+        name=provider,
+        status=HealthState.HEALTHY,
+        details={**details, "model_count": _model_count(response)},
+    )
+
+
+def _model_count(response: Any) -> int:
+    data = getattr(response, "data", response)
+    if isinstance(data, Sized):
+        return len(data)
+    try:
+        return sum(1 for _ in data)
+    except TypeError:
+        return 0
 
 
 async def iter_any(value: Any) -> AsyncIterator[Any]:
@@ -20,6 +49,14 @@ async def iter_any(value: Any) -> AsyncIterator[Any]:
         return
     for item in value:
         yield item
+
+
+async def close_client(client: Any) -> None:
+    if client is None:
+        return
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close is not None:
+        await maybe_await(close())
 
 
 def message_dicts(messages: list[ChatMessage]) -> list[dict[str, Any]]:

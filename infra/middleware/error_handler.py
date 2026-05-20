@@ -11,18 +11,18 @@
 - AppException: 应用基础异常
 """
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from enum import Enum
 from functools import wraps
-from typing import Any, TypeVar
+from typing import Any, ParamSpec, TypeVar, cast
 
 from infra.exceptions import AppException
 from infra.logging import get_logger
 
-
 logger = get_logger(__name__)
 
 T = TypeVar("T")
+P = ParamSpec("P")
 
 
 class ErrorStrategy(str, Enum):
@@ -65,7 +65,9 @@ class ErrorContext:
         self.alert = alert
 
 
-def handle_error(context: ErrorContext):
+def handle_error(
+    context: ErrorContext,
+) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Awaitable[T]]]:
     """
     错误处理装饰器
 
@@ -94,9 +96,9 @@ def handle_error(context: ErrorContext):
     ```
     """
 
-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+    def decorator(func: Callable[P, Awaitable[T]]) -> Callable[P, Awaitable[T]]:
         @wraps(func)
-        async def wrapper(*args, **kwargs) -> T:
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             try:
                 return await func(*args, **kwargs)
 
@@ -112,7 +114,7 @@ def handle_error(context: ErrorContext):
                         "alert": context.alert,
                     },
                 )
-                return _handle_by_strategy(context, e)
+                return cast(T, _handle_by_strategy(context, e))
 
             except Exception as e:
                 # 未预期的错误
@@ -126,7 +128,7 @@ def handle_error(context: ErrorContext):
                         "alert": context.alert,
                     },
                 )
-                return _handle_by_strategy(context, e)
+                return cast(T, _handle_by_strategy(context, e))
 
         return wrapper
 
@@ -223,9 +225,7 @@ class ErrorCategories:
 def handle_db_query_error(operation: str):
     """处理数据库查询错误"""
     return handle_error(
-        ErrorContext(
-            operation=operation, strategy=ErrorStrategy.RETURN_NONE, log_level="error"
-        )
+        ErrorContext(operation=operation, strategy=ErrorStrategy.RETURN_NONE, log_level="error")
     )
 
 
@@ -272,9 +272,7 @@ def handle_service_error(operation: str, default_value=None):
     可选择返回默认值或传播异常
     """
     strategy = (
-        ErrorStrategy.RETURN_DEFAULT
-        if default_value is not None
-        else ErrorStrategy.PROPAGATE
+        ErrorStrategy.RETURN_DEFAULT if default_value is not None else ErrorStrategy.PROPAGATE
     )
     return handle_error(
         ErrorContext(

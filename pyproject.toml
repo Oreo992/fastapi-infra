@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastapi-infra"
 version = "0.2.0"
-description = "高性能、生产级的 FastAPI 基础设施包"
+description = "模块化、AI 友好的 FastAPI 基础设施包"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [
     { name = "AIMidPlatform Team" }
@@ -16,7 +17,6 @@ keywords = ["fastapi", "infrastructure", "microservices", "async", "database", "
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -38,13 +38,20 @@ mysql = ["aiomysql>=0.2.0,<0.3.0"]
 redis = ["redis>=6.4.0,<7.0.0"]
 http = [
     "aiohttp>=3.12.0,<4.0.0",
-    "httpx>=0.25.0,<0.26.0",
+    "httpx>=0.27.0,<0.29.0",
     "orjson>=3.10.0,<4.0.0",
 ]
 ai-openai = ["openai>=1.0.0"]
 ai-anthropic = ["anthropic>=0.40.0"]
 ai-gemini = ["google-genai>=1.0.0"]
 ai = [
+    "openai>=1.0.0",
+    "anthropic>=0.40.0",
+    "google-genai>=1.0.0",
+]
+live-providers = [
+    "aiomysql>=0.2.0,<0.3.0",
+    "redis>=6.4.0,<7.0.0",
     "openai>=1.0.0",
     "anthropic>=0.40.0",
     "google-genai>=1.0.0",
@@ -64,13 +71,17 @@ dev = [
     "isort>=5.12.0",
     "mypy>=1.7.0",
     "anyio>=4.0.0",
+    "httpx>=0.27.0,<0.29.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/your/fastapi-infra"
-Documentation = "https://github.com/your/fastapi-infra/blob/main/README.md"
-Repository = "https://github.com/your/fastapi-infra"
-Issues = "https://github.com/your/fastapi-infra/issues"
+Homepage = "https://github.com/Oreo992/fastapi-infra"
+Documentation = "https://github.com/Oreo992/fastapi-infra/blob/main/README.md"
+Repository = "https://github.com/Oreo992/fastapi-infra"
+Issues = "https://github.com/Oreo992/fastapi-infra/issues"
+
+[project.scripts]
+fastapi-infra = "infra.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -95,3 +106,6 @@ disallow_untyped_defs = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: opt-in live provider tests skipped unless required credentials are set",
+]

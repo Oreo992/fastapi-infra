@@ -2,7 +2,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-
 Role = Literal["system", "user", "assistant", "tool"]
 
 
@@ -45,3 +44,15 @@ class ChatChunk(BaseModel):
     model: str
     content: str = ""
     tool_calls: list[ToolCall] = Field(default_factory=list)
+
+
+class EmbeddingRequest(BaseModel):
+    model: str
+    input: str | list[str]
+
+
+class EmbeddingResponse(BaseModel):
+    provider: str
+    model: str
+    embeddings: list[list[float]]
+    raw: Any = None

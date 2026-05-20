@@ -5,15 +5,17 @@
 """
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from infra.logging import get_logger
 
-
 logger = get_logger(__name__)
+
+P = ParamSpec("P")
+T = TypeVar("T")
 
 
 @dataclass
@@ -40,9 +42,9 @@ class RetryMechanism:
     def __init__(self, config: RetryConfig):
         self.config = config
 
-    async def execute(self, func: Callable, *args, **kwargs) -> Any:
+    async def execute(self, func: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T:
         """执行函数并应用重试逻辑"""
-        last_exception = None
+        last_exception: Exception | None = None
 
         for attempt in range(self.config.max_attempts):
             try:
@@ -80,6 +82,8 @@ class RetryMechanism:
                 )
                 await asyncio.sleep(delay)
 
+        if last_exception is None:
+            raise RuntimeError("retry configuration must allow at least one attempt")
         raise last_exception
 
     def _calculate_delay(self, attempt: int) -> float:
@@ -102,7 +106,7 @@ class TimeoutManager:
     def __init__(self, config: TimeoutConfig):
         self.config = config
 
-    async def execute(self, func: Callable, *args, **kwargs) -> Any:
+    async def execute(self, func: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T:
         """执行函数并应用超时控制"""
         try:
             return await asyncio.wait_for(
@@ -122,57 +126,30 @@ class TimeoutManager:
             raise Exception(f"操作超时 ({self.config.timeout_seconds}s)") from e
 
 
-class ResilienceManager:
-    """弹性管理器 - 组合重试和超时机制"""
-
-    def __init__(self):
-        self.retry_mechanisms: dict[str, RetryMechanism] = {}
-        self.timeout_managers: dict[str, TimeoutManager] = {}
-
-    def get_retry_mechanism(self, name: str, config: RetryConfig) -> RetryMechanism:
-        """获取重试机制实例"""
-        if name not in self.retry_mechanisms:
-            self.retry_mechanisms[name] = RetryMechanism(config)
-        return self.retry_mechanisms[name]
-
-    def get_timeout_manager(self, name: str, config: TimeoutConfig) -> TimeoutManager:
-        """获取超时管理器实例"""
-        if name not in self.timeout_managers:
-            self.timeout_managers[name] = TimeoutManager(config)
-        return self.timeout_managers[name]
-
-
-# 全局弹性管理器实例
-resilience_manager = ResilienceManager()
-
-
 def with_resilience(
     retry_config: RetryConfig | None = None,
     timeout_config: TimeoutConfig | None = None,
     service_name: str | None = None,
-):
+) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Coroutine[Any, Any, T]]]:
     """弹性装饰器 - 支持重试和超时"""
 
-    def decorator(func):
+    def decorator(func: Callable[P, Awaitable[T]]) -> Callable[P, Coroutine[Any, Any, T]]:
+        retry_mechanism = RetryMechanism(retry_config) if retry_config else None
+        timeout_manager = TimeoutManager(timeout_config) if timeout_config else None
+
         @wraps(func)
-        async def wrapper(*args, **kwargs):
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             func_name = service_name or func.__name__
 
-            async def execute():
+            async def execute() -> T:
                 # 超时控制
-                if timeout_config:
-                    timeout_manager = resilience_manager.get_timeout_manager(
-                        f"{func_name}_timeout", timeout_config
-                    )
+                if timeout_manager:
                     return await timeout_manager.execute(func, *args, **kwargs)
                 else:
                     return await func(*args, **kwargs)
 
             # 重试机制
-            if retry_config:
-                retry_mechanism = resilience_manager.get_retry_mechanism(
-                    f"{func_name}_retry", retry_config
-                )
+            if retry_mechanism:
                 return await retry_mechanism.execute(execute)
             else:
                 return await execute()

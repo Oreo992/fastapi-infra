@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 
 from infra import InfraSettings, setup_infra
-
+from infra.plugins import AI_SERVICE
 
 settings = InfraSettings(
     infra={
@@ -19,6 +19,6 @@ infra = setup_infra(app, settings)
 
 @app.post("/chat")
 async def chat(payload: dict):
-    ai = infra.get("ai")
+    ai = infra.require(AI_SERVICE)
     response = await ai.chat_text(payload["message"])
     return response.model_dump()

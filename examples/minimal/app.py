@@ -2,7 +2,6 @@ from fastapi import FastAPI
 
 from infra import InfraSettings, setup_infra
 
-
 app = FastAPI(title="fastapi-infra minimal")
 infra = setup_infra(app, InfraSettings())
 
@@ -14,7 +13,4 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {
-        name: status.model_dump()
-        for name, status in infra.health.snapshot().items()
-    }
+    return {name: status.model_dump() for name, status in infra.health.snapshot().items()}

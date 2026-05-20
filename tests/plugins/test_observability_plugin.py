@@ -30,3 +30,28 @@ async def test_observability_plugin_registers_service_and_reads_health_snapshot(
     assert snapshot["observability"].status is HealthState.HEALTHY
 
     await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_observability_plugin_can_register_prometheus_metrics_backend():
+    pytest.importorskip("prometheus_client")
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "observability": {
+                    "enabled": True,
+                    "config": {"metrics_backend": "prometheus"},
+                }
+            }
+        }
+    )
+    manager = PluginManager(settings=settings, plugins=[ObservabilityPlugin()])
+
+    await manager.startup()
+
+    service = manager.get("observability")
+    assert isinstance(service, ObservabilityService)
+    service.increment("requests_total")
+    assert "# TYPE requests_total counter" in (service.render_metrics() or "")
+
+    await manager.shutdown()

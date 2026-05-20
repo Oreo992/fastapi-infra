@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 import pytest
@@ -11,7 +12,12 @@ from infra.plugins.contract import PluginContext, PluginMetadata
 
 
 class SimplePlugin:
-    metadata = PluginMetadata(name="simple", version="1.0.0", default_enabled=True)
+    metadata = PluginMetadata(
+        name="simple",
+        version="1.0.0",
+        default_enabled=True,
+        provides=["simple"],
+    )
     config_model = None
 
     def __init__(self, events: list[str] | None = None) -> None:
@@ -36,6 +42,22 @@ class SimplePlugin:
         return ctx.health_status("simple", HealthState.HEALTHY)
 
 
+class SlowHealthPlugin(SimplePlugin):
+    metadata = PluginMetadata(
+        name="slow_health",
+        version="1.0.0",
+        default_enabled=True,
+        provides=["slow_health"],
+    )
+
+    def register(self, ctx: PluginContext) -> None:
+        ctx.services["slow_health"] = {"ready": True}
+
+    async def health_check(self, ctx: PluginContext):
+        await asyncio.sleep(1)
+        return ctx.health_status("slow_health", HealthState.HEALTHY)
+
+
 def test_setup_infra_attaches_context_to_app():
     app = FastAPI()
     settings = InfraSettings()
@@ -45,6 +67,34 @@ def test_setup_infra_attaches_context_to_app():
     assert isinstance(infra, InfraContext)
     assert app.state.infra is infra
     assert infra.get("simple") is None
+
+
+def test_setup_infra_passes_startup_health_check_timeout():
+    app = FastAPI()
+    infra = setup_infra(
+        app,
+        InfraSettings(),
+        plugins=[SlowHealthPlugin()],
+        health_check_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        with TestClient(app):
+            pass
+
+    assert infra.health.snapshot()["slow_health"].status is HealthState.UNHEALTHY
+
+
+def test_setup_infra_rejects_negative_health_check_timeout():
+    app = FastAPI()
+
+    with pytest.raises(ValueError, match="health_check_timeout_seconds"):
+        setup_infra(
+            app,
+            InfraSettings(),
+            plugins=[SimplePlugin()],
+            health_check_timeout_seconds=-1,
+        )
 
 
 def test_context_get_returns_registered_service_after_manual_startup():

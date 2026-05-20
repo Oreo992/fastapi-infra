@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastapi-infra-search-plugin-example"
+version = "0.1.0"
+description = "Example external search plugin for fastapi-infra"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["fastapi-infra>=0.2.0"]
+
+[project.entry-points."fastapi_infra.plugins"]
+search = "fastapi_infra_search_plugin:SearchPlugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["fastapi_infra_search_plugin*"]

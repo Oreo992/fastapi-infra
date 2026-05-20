@@ -1,6 +1,14 @@
 from collections.abc import AsyncIterator
 
-from infra.plugins.ai.models import ChatChunk, ChatMessage, ChatRequest, ChatResponse
+from infra.plugins.ai.adapters._shared import close_client
+from infra.plugins.ai.models import (
+    ChatChunk,
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    EmbeddingRequest,
+    EmbeddingResponse,
+)
 from infra.plugins.ai.providers.base import AIProvider
 
 
@@ -21,6 +29,9 @@ class AIRegistry:
         except KeyError as exc:
             raise LookupError(f"unknown ai provider: {name}") from exc
 
+    def names(self) -> list[str]:
+        return sorted(self._providers)
+
     async def chat(
         self,
         request: ChatRequest,
@@ -36,6 +47,22 @@ class AIRegistry:
         provider: str | None = None,
     ) -> AsyncIterator[ChatChunk]:
         return self.get(provider).stream_chat(request)
+
+    async def embed(
+        self,
+        request: EmbeddingRequest,
+        *,
+        provider: str | None = None,
+    ) -> EmbeddingResponse:
+        return await self.get(provider).embed(request)
+
+    async def aclose(self) -> None:
+        for provider in self._providers.values():
+            close = getattr(provider, "aclose", None)
+            if close is not None:
+                await close_client(provider)
+                continue
+            await close_client(getattr(provider, "_client", None))
 
     async def chat_text(
         self,

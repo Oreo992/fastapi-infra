@@ -1,156 +1,157 @@
-"""
-缓存服务 - 基于 Redis
-
-简单易用的 Redis 缓存封装
-"""
-from typing import Any
-
-import orjson
+import json
+import time
+from typing import Any, cast
 
 from infra.database.manager import DatabaseManager
 from infra.logging import get_logger
 
-
 logger = get_logger(__name__)
 
 
+try:
+    import orjson as _orjson
+
+    orjson: Any | None = _orjson
+except ImportError:  # pragma: no cover - covered by subprocess import guard
+    orjson = None
+
+
+def _json_loads(value: str | bytes) -> Any:
+    if orjson is not None:
+        return orjson.loads(value)
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return json.loads(value)
+
+
+def _json_dumps(value: Any) -> bytes:
+    if orjson is not None:
+        return cast(bytes, orjson.dumps(value))
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 class CacheService:
-    """Redis 缓存服务
-    
-    使用示例:
-        # 创建缓存服务（可选命名空间隔离）
-        cache = CacheService(namespace="my_feature", db_manager=db_manager)
-        
-        # 设置缓存（默认 1 小时）
-        await cache.set("key", {"data": "value"})
-        
-        # 获取缓存
-        data = await cache.get("key")
-        
-        # 自定义 TTL
-        await cache.set("key", data, ttl=300)  # 5 分钟
-        
-        # 删除缓存
-        await cache.delete("key")
-    """
+    """Small Redis cache facade backed by an explicit DatabaseManager."""
 
     def __init__(self, namespace: str, db_manager: DatabaseManager):
-        """初始化缓存服务
-        
-        Args:
-            namespace: 命名空间，用于键前缀隔离
-            db_manager: DatabaseManager 实例，由调用方或插件显式管理
-        """
         self.namespace = namespace
         self._db_manager = db_manager
 
     def _make_key(self, key: str) -> str:
-        """生成带命名空间的键"""
         return f"{self.namespace}:{key}" if self.namespace else key
 
+    async def health_check(self) -> bool:
+        try:
+            redis = await self._db_manager.get_redis_client()
+            return bool(await redis.ping())
+        except Exception as exc:
+            logger.error(f"Cache health check failed: {exc}")
+            return False
+
     async def get(self, key: str) -> Any:
-        """获取缓存
-        
-        Args:
-            key: 缓存键
-            
-        Returns:
-            缓存值，不存在返回 None
-        """
-        redis = await self._db_manager._get_or_create_redis_client()
+        redis = await self._db_manager.get_redis_client()
         full_key = self._make_key(key)
-        
+
         try:
             value = await redis.get(full_key)
             if value:
                 try:
-                    # 尝试 JSON 反序列化
-                    return orjson.loads(value)
+                    return _json_loads(value)
                 except Exception:
-                    # 如果不是 JSON，直接返回字符串
                     return value
             return None
-        except Exception as e:
-            logger.error(f"获取缓存失败: {full_key}, 错误: {e}")
+        except Exception as exc:
+            logger.error(f"Cache get failed for {full_key}: {exc}")
             return None
 
     async def set(self, key: str, value: Any, ttl: int = 3600) -> bool:
-        """设置缓存
-        
-        Args:
-            key: 缓存键
-            value: 缓存值（自动 JSON 序列化）
-            ttl: 过期时间（秒），默认 1 小时
-            
-        Returns:
-            成功返回 True，失败返回 False
-        """
-        redis = await self._db_manager._get_or_create_redis_client()
+        redis = await self._db_manager.get_redis_client()
         full_key = self._make_key(key)
-        
+
         try:
-            # JSON 序列化
-            serialized = orjson.dumps(value)
+            serialized = _json_dumps(value)
             await redis.setex(full_key, ttl, serialized)
             return True
-        except Exception as e:
-            logger.error(f"设置缓存失败: {full_key}, 错误: {e}")
+        except Exception as exc:
+            logger.error(f"Cache set failed for {full_key}: {exc}")
             return False
 
     async def delete(self, key: str) -> bool:
-        """删除缓存
-        
-        Args:
-            key: 缓存键
-            
-        Returns:
-            成功返回 True，失败返回 False
-        """
-        redis = await self._db_manager._get_or_create_redis_client()
+        redis = await self._db_manager.get_redis_client()
         full_key = self._make_key(key)
-        
+
         try:
             result = await redis.delete(full_key)
-            return result > 0
-        except Exception as e:
-            logger.error(f"删除缓存失败: {full_key}, 错误: {e}")
+            return cast(bool, result > 0)
+        except Exception as exc:
+            logger.error(f"Cache delete failed for {full_key}: {exc}")
             return False
 
     async def exists(self, key: str) -> bool:
-        """检查缓存是否存在
-        
-        Args:
-            key: 缓存键
-            
-        Returns:
-            存在返回 True，不存在返回 False
-        """
-        redis = await self._db_manager._get_or_create_redis_client()
+        redis = await self._db_manager.get_redis_client()
         full_key = self._make_key(key)
-        
+
         try:
             result = await redis.exists(full_key)
-            return result > 0
-        except Exception as e:
-            logger.error(f"检查缓存失败: {full_key}, 错误: {e}")
+            return cast(bool, result > 0)
+        except Exception as exc:
+            logger.error(f"Cache exists failed for {full_key}: {exc}")
             return False
 
     async def expire(self, key: str, ttl: int) -> bool:
-        """设置缓存过期时间
-        
-        Args:
-            key: 缓存键
-            ttl: 过期时间（秒）
-            
-        Returns:
-            成功返回 True，失败返回 False
-        """
-        redis = await self._db_manager._get_or_create_redis_client()
+        redis = await self._db_manager.get_redis_client()
         full_key = self._make_key(key)
-        
+
         try:
             result = await redis.expire(full_key, ttl)
-            return result
-        except Exception as e:
-            logger.error(f"设置过期时间失败: {full_key}, 错误: {e}")
+            return cast(bool, result)
+        except Exception as exc:
+            logger.error(f"Cache expire failed for {full_key}: {exc}")
             return False
+
+
+class MemoryCacheService:
+    """In-process cache for local development and tests."""
+
+    def __init__(self, namespace: str = "") -> None:
+        self.namespace = namespace
+        self._items: dict[str, tuple[Any, float | None]] = {}
+
+    def _make_key(self, key: str) -> str:
+        return f"{self.namespace}:{key}" if self.namespace else key
+
+    async def health_check(self) -> bool:
+        return True
+
+    async def get(self, key: str) -> Any:
+        full_key = self._make_key(key)
+        item = self._items.get(full_key)
+        if item is None:
+            return None
+        value, expires_at = item
+        if expires_at is not None and expires_at <= time.monotonic():
+            self._items.pop(full_key, None)
+            return None
+        return value
+
+    async def set(self, key: str, value: Any, ttl: int = 3600) -> bool:
+        full_key = self._make_key(key)
+        expires_at = time.monotonic() + ttl if ttl > 0 else None
+        self._items[full_key] = (value, expires_at)
+        return True
+
+    async def delete(self, key: str) -> bool:
+        full_key = self._make_key(key)
+        return self._items.pop(full_key, None) is not None
+
+    async def exists(self, key: str) -> bool:
+        return await self.get(key) is not None
+
+    async def expire(self, key: str, ttl: int) -> bool:
+        value = await self.get(key)
+        if value is None:
+            return False
+        full_key = self._make_key(key)
+        expires_at = time.monotonic() + ttl if ttl > 0 else None
+        self._items[full_key] = (value, expires_at)
+        return True

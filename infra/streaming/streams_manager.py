@@ -11,11 +11,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-import redis.asyncio as redis
-
-from infra.database.manager import DatabaseManager
+from infra.database.manager import DatabaseManager, _load_redis
 from infra.logging import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -71,9 +68,7 @@ class StreamMessage:
             processed_data["params"] = json.loads(processed_data["params"])
 
         processed_data["message_id"] = message_id
-        processed_data["status"] = MessageStatus(
-            processed_data.get("status", "pending")
-        )
+        processed_data["status"] = MessageStatus(processed_data.get("status", "pending"))
 
         return cls(**processed_data)
 
@@ -119,7 +114,7 @@ class StreamsManager:
             config: Stream 配置
         """
         self.config = config
-        self._redis: redis.Redis | None = None
+        self._redis: Any | None = None
         self._initialized = False
         self._running = False
         self._consumer_task: asyncio.Task | None = None
@@ -132,7 +127,7 @@ class StreamsManager:
         避免在多事件循环环境下出现"Future attached to a different loop"错误
         """
         await self._db_manager.initialize()
-        return await self._db_manager._get_or_create_redis_client()
+        return await self._db_manager.get_redis_client()
 
     async def initialize(self):
         """初始化 Streams"""
@@ -165,12 +160,10 @@ class StreamsManager:
                 mkstream=True,
             )
             logger.info(f"创建消费者组: {self.config.consumer_group} on {stream_name}")
-        except redis.ResponseError as e:
+        except _load_redis().ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
-            logger.debug(
-                f"消费者组已存在: {self.config.consumer_group} on {stream_name}"
-            )
+            logger.debug(f"消费者组已存在: {self.config.consumer_group} on {stream_name}")
 
     # ==================== 生产者方法 ====================
 
@@ -180,7 +173,7 @@ class StreamsManager:
         task_type: str,
         params: dict[str, Any],
         priority: int = 5,
-        max_retries: int = None,
+        max_retries: int | None = None,
     ) -> str:
         """
         发布消息到 Stream
@@ -224,17 +217,20 @@ class StreamsManager:
             }
 
             # 发布到 Stream (使用 MAXLEN 控制大小)
-            message_id = await redis_client.xadd(
+            raw_message_id = await redis_client.xadd(
                 name=self.config.stream_name,
                 fields=message_data,
                 maxlen=self.config.max_len,
                 approximate=True,
             )
-
-            logger.info(
-                f"消息已发布: {message_id.decode()}, task_id={task_id}, type={task_type}"
+            message_id = (
+                raw_message_id.decode()
+                if isinstance(raw_message_id, bytes)
+                else str(raw_message_id)
             )
-            return message_id.decode()
+
+            logger.info(f"消息已发布: {message_id}, task_id={task_id}, type={task_type}")
+            return message_id
 
         except Exception as e:
             logger.error(f"发布消息失败: {e}", exc_info=True)
@@ -297,9 +293,7 @@ class StreamsManager:
                 # 3. 处理消息
                 for _stream_name, stream_messages in messages:
                     for message_id, message_data in stream_messages:
-                        await self._process_message(
-                            message_id.decode(), message_data, handler
-                        )
+                        await self._process_message(message_id.decode(), message_data, handler)
 
             except asyncio.CancelledError:
                 logger.info("消费循环被取消")
@@ -341,9 +335,7 @@ class StreamsManager:
             except Exception:
                 pass
 
-    async def _claim_pending_messages(
-        self, handler: Callable[[StreamMessage], Awaitable[bool]]
-    ):
+    async def _claim_pending_messages(self, handler: Callable[[StreamMessage], Awaitable[bool]]):
         """认领并处理 Pending 消息（恢复机制）"""
         try:
             # 获取Redis客户端
@@ -378,9 +370,7 @@ class StreamsManager:
                     if claimed:
                         for msg_id, msg_data in claimed:
                             logger.info(f"认领 Pending 消息: {msg_id.decode()}")
-                            await self._process_message(
-                                msg_id.decode(), msg_data, handler
-                            )
+                            await self._process_message(msg_id.decode(), msg_data, handler)
 
         except Exception as e:
             logger.error(f"认领 Pending 消息失败: {e}", exc_info=True)
@@ -391,9 +381,7 @@ class StreamsManager:
         """确认消息已处理"""
         try:
             redis_client = await self._get_redis_client()
-            await redis_client.xack(
-                self.config.stream_name, self.config.consumer_group, message_id
-            )
+            await redis_client.xack(self.config.stream_name, self.config.consumer_group, message_id)
             logger.debug(f"消息已 ACK: {message_id}")
         except Exception as e:
             logger.error(f"ACK 消息失败: {message_id}, error={e}")
@@ -415,9 +403,7 @@ class StreamsManager:
                     max_retries=message.max_retries,
                 )
 
-                logger.info(
-                    f"消息重试: {message.message_id}, retry={message.retry_count}"
-                )
+                logger.info(f"消息重试: {message.message_id}, retry={message.retry_count}")
             else:
                 # 进入死信队列
                 await self._move_to_dead_letter(message, original_data)
@@ -481,14 +467,12 @@ class StreamsManager:
             logger.error(f"获取统计信息失败: {e}")
             return {}
 
-    async def trim_stream(self, max_len: int = None):
+    async def trim_stream(self, max_len: int | None = None) -> None:
         """修剪 Stream（控制内存）"""
         try:
             redis_client = await self._get_redis_client()
             max_len = max_len or self.config.max_len
-            await redis_client.xtrim(
-                self.config.stream_name, maxlen=max_len, approximate=True
-            )
+            await redis_client.xtrim(self.config.stream_name, maxlen=max_len, approximate=True)
             logger.info(f"Stream 已修剪: {self.config.stream_name}, maxlen={max_len}")
         except Exception as e:
             logger.error(f"修剪 Stream 失败: {e}")

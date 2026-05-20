@@ -1,9 +1,7 @@
-"""事务协调器
+"""Saga transaction coordinator for cross-system workflows."""
 
-实现Saga补偿模式，协调跨多个存储系统的事务一致性
-"""
-
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from infra.logging import get_logger
@@ -13,101 +11,160 @@ logger = get_logger(__name__)
 
 @dataclass
 class Operation:
-    """操作定义"""
+    """A single Saga step."""
 
     name: str
     execute: Callable[[], Awaitable[Any]]
     compensate: Callable[[], Awaitable[None]] | None = None
+    timeout_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class OperationFailure:
+    """A failed operation or compensation step."""
+
+    operation: str
+    error: Exception
 
 
 @dataclass
 class TransactionResult:
-    """事务结果"""
+    """Result of a Saga transaction run."""
 
     success: bool
     completed_operations: list[str]
-    failed_operation: str | None = None
+    results: dict[str, Any] = field(default_factory=dict)
+    failed_operations: list[OperationFailure] = field(default_factory=list)
+    compensated_operations: list[str] = field(default_factory=list)
+    compensation_failures: list[OperationFailure] = field(default_factory=list)
     error: Exception | None = None
-    data: Any = None
+
+    @property
+    def failed_operation(self) -> str | None:
+        """Return the first failed operation name for compact status reporting."""
+        if not self.failed_operations:
+            return None
+        return self.failed_operations[0].operation
+
+    @property
+    def compensation_succeeded(self) -> bool:
+        """Whether all attempted compensation steps completed."""
+        return not self.compensation_failures
 
 
 class TransactionCoordinator:
-    """事务协调器 - Saga补偿模式"""
+    """Saga coordinator with explicit execution and compensation reports."""
 
     async def execute_with_compensation(
-        self, operations: list[Operation], stop_on_error: bool = True
+        self, operations: list[Operation], *, continue_on_error: bool = False
     ) -> TransactionResult:
-        """执行操作序列，失败时自动补偿
+        """Execute operations in order and compensate completed steps on failure.
 
         Args:
-            operations: 操作列表（按顺序执行）
-            stop_on_error: 遇到错误是否立即停止
+            operations: Steps to execute in order.
+            continue_on_error: Keep running later steps after a failure. When true,
+                compensation is not attempted automatically because later operations
+                may depend on the successful subset.
 
         Returns:
-            TransactionResult
+            Detailed transaction report.
         """
-        completed = []
-        compensation_stack = []
+        self._validate_operations(operations)
+
+        completed: list[str] = []
+        results: dict[str, Any] = {}
+        failed: list[OperationFailure] = []
+        compensation_stack: list[Operation] = []
 
         try:
-            # 执行所有操作
             for op in operations:
                 logger.info(f"执行操作: {op.name}")
 
                 try:
-                    result = await op.execute()
+                    result = await self._execute_operation(op)
                     completed.append(op.name)
+                    results[op.name] = result
 
-                    # 记录补偿操作
                     if op.compensate:
                         compensation_stack.append(op)
 
                 except Exception as e:
                     logger.error(f"操作失败: {op.name}, 错误: {e}")
+                    failed.append(OperationFailure(operation=op.name, error=e))
 
-                    if stop_on_error:
-                        # 执行补偿
-                        await self._compensate(compensation_stack)
+                    if not continue_on_error:
+                        compensation_report = await self._compensate(compensation_stack)
 
                         return TransactionResult(
                             success=False,
                             completed_operations=completed,
-                            failed_operation=op.name,
+                            results=results,
+                            failed_operations=failed,
+                            compensated_operations=compensation_report[0],
+                            compensation_failures=compensation_report[1],
                             error=e,
                         )
-                    else:
-                        # 继续执行
-                        logger.warning(f"忽略错误，继续执行: {op.name}")
 
-            return TransactionResult(success=True, completed_operations=completed)
+                    logger.warning(f"忽略错误，继续执行: {op.name}")
+
+            return TransactionResult(
+                success=not failed,
+                completed_operations=completed,
+                results=results,
+                failed_operations=failed,
+                error=failed[0].error if failed else None,
+            )
 
         except Exception as e:
             logger.error(f"事务执行异常: {e}", exc_info=True)
-            await self._compensate(compensation_stack)
+            compensation_report = await self._compensate(compensation_stack)
 
             return TransactionResult(
-                success=False, completed_operations=completed, error=e
+                success=False,
+                completed_operations=completed,
+                results=results,
+                compensated_operations=compensation_report[0],
+                compensation_failures=compensation_report[1],
+                error=e,
             )
 
-    async def _compensate(self, compensation_stack: list[Operation]):
-        """执行补偿操作（逆序）
+    async def _execute_operation(self, operation: Operation) -> Any:
+        if operation.timeout_seconds is None:
+            return await operation.execute()
+        return await asyncio.wait_for(operation.execute(), timeout=operation.timeout_seconds)
 
-        Args:
-            compensation_stack: 需要补偿的操作列表
-        """
+    async def _compensate(
+        self, compensation_stack: list[Operation]
+    ) -> tuple[list[str], list[OperationFailure]]:
+        """Run compensation steps in reverse order."""
+
         if not compensation_stack:
-            return
+            return [], []
 
         logger.warning(f"开始执行补偿操作: {len(compensation_stack)}个")
+        compensated: list[str] = []
+        failures: list[OperationFailure] = []
 
-        # 逆序执行补偿
         for op in reversed(compensation_stack):
             try:
                 logger.info(f"补偿操作: {op.name}")
-                await op.compensate()
+                if op.compensate is not None:
+                    await op.compensate()
+                    compensated.append(op.name)
             except Exception as e:
                 logger.error(f"补偿操作失败: {op.name}, 错误: {e}", exc_info=True)
-                # 补偿失败不中断，继续尝试其他补偿
+                failures.append(OperationFailure(operation=op.name, error=e))
 
         logger.info("补偿操作完成")
+        return compensated, failures
 
+    def _validate_operations(self, operations: list[Operation]) -> None:
+        names: set[str] = set()
+        for op in operations:
+            if not op.name.strip():
+                raise ValueError("operation name must not be empty")
+            if op.name in names:
+                raise ValueError(f"duplicate operation name: {op.name}")
+            names.add(op.name)
+            if op.timeout_seconds is not None and op.timeout_seconds <= 0:
+                raise ValueError(f"operation timeout must be positive: {op.name}")

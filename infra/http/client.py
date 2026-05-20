@@ -6,23 +6,59 @@
 """
 
 import asyncio
+import inspect
+import json
+import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, ContextManager, Protocol, cast
 from urllib.parse import urljoin
 
-import aiohttp
-import orjson
-from aiohttp import ClientSession, ClientTimeout
-
-from infra.logging import get_logger
-
+from infra.logging import get_logger, get_request_id, get_trace_id
 
 logger = get_logger(__name__)
+TRACE_ID_HEADER = "X-Trace-ID"
+REQUEST_ID_HEADER = "X-Request-ID"
+
+
+try:
+    import orjson as _orjson
+
+    orjson: Any | None = _orjson
+except ImportError:  # pragma: no cover - covered by subprocess import guard
+    orjson = None
+
+
+def _load_aiohttp() -> Any:
+    try:
+        import aiohttp
+    except ImportError as exc:
+        raise RuntimeError(
+            "aiohttp is required to use HttpClient. Install fastapi-infra[http]."
+        ) from exc
+    return aiohttp
 
 
 def _orjson_dumps(obj: Any) -> str:
-    return orjson.dumps(obj).decode("utf-8")
+    if orjson is not None:
+        return cast(str, orjson.dumps(obj).decode("utf-8"))
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_loads(value: str) -> Any:
+    if orjson is not None:
+        return orjson.loads(value)
+    return json.loads(value)
+
+
+async def _release_response(response: Any) -> None:
+    result = response.release()
+    if inspect.isawaitable(result):
+        await result
+
+
+def _has_header(headers: dict[str, str], name: str) -> bool:
+    return any(key.lower() == name.lower() for key in headers)
 
 
 @dataclass
@@ -43,15 +79,40 @@ class HttpResponse:
     def json(self) -> dict[str, Any]:
         """解析JSON响应"""
         try:
-            return orjson.loads(self.text)
-        except orjson.JSONDecodeError as e:
+            return cast(dict[str, Any], _json_loads(self.text))
+        except ValueError as e:
             logger.error(f"JSON解析失败: {e}, 内容: {self.text[:200]}")
             raise
 
     def raise_for_status(self):
         """如果状态码不成功则抛出异常"""
         if not self.is_success:
-            raise HttpError(f"HTTP {self.status_code}: {self.text[:200]}")
+            raise HttpError(f"HTTP {self.status_code}: {self.text[:200]}", response=self)
+
+
+@dataclass(frozen=True)
+class HttpRetryConfig:
+    """HTTP-specific retry policy.
+
+    The policy is intentionally conservative: only idempotent methods are retried
+    unless retry_all_methods is enabled by the caller.
+    """
+
+    max_attempts: int = 1
+    base_delay: float = 0.25
+    retry_status_codes: frozenset[int] = field(
+        default_factory=lambda: frozenset({429, 500, 502, 503, 504})
+    )
+    retry_methods: frozenset[str] = field(
+        default_factory=lambda: frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+    )
+    retry_all_methods: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_attempts, bool) or self.max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
+        if isinstance(self.base_delay, bool) or self.base_delay < 0:
+            raise ValueError("base_delay must be a non-negative number")
 
 
 @dataclass
@@ -68,7 +129,7 @@ class HttpRequest:
 
     def to_kwargs(self) -> dict[str, Any]:
         """转换为aiohttp的请求参数"""
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "method": self.method,
             "url": self.url,
             "headers": self.headers or {},
@@ -86,7 +147,7 @@ class HttpRequest:
 
         # 设置超时
         if self.timeout:
-            kwargs["timeout"] = ClientTimeout(total=self.timeout)
+            kwargs["timeout"] = _load_aiohttp().ClientTimeout(total=self.timeout)
 
         return kwargs
 
@@ -97,6 +158,18 @@ class HttpError(Exception):
     def __init__(self, message: str, response: HttpResponse | None = None):
         super().__init__(message)
         self.response = response
+
+
+class HttpInstrumentation(Protocol):
+    def increment(self, name: str, amount: int = 1) -> None: ...
+
+    def timing(self, name: str, value: float) -> None: ...
+
+    def span(
+        self,
+        name: str,
+        attributes: dict[str, str | int | float | bool] | None = None,
+    ) -> ContextManager[Any]: ...
 
 
 class HttpClient:
@@ -111,6 +184,10 @@ class HttpClient:
         base_url: str = "",
         timeout: float = 30.0,
         headers: dict[str, str] | None = None,
+        retry_config: HttpRetryConfig | None = None,
+        retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        instrumentation: HttpInstrumentation | None = None,
+        propagate_trace_headers: bool = True,
         max_connections: int = 200,
         max_connections_per_host: int = 30,
         keepalive_timeout: int = 60,
@@ -122,6 +199,10 @@ class HttpClient:
             base_url: 基础URL
             timeout: 默认超时时间（秒）
             headers: 默认请求头
+            retry_config: 默认 HTTP 重试策略，None 表示不重试
+            retry_sleep: 重试等待函数，测试可注入 no-op
+            instrumentation: 可选观测服务，记录出站 HTTP 指标和 span
+            propagate_trace_headers: 是否自动传播当前 trace/request id 到出站请求头
             max_connections: 最大连接数
             max_connections_per_host: 每个主机的最大连接数
             keepalive_timeout: 连接保活时间（秒）
@@ -129,6 +210,10 @@ class HttpClient:
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.default_timeout = timeout
         self.default_headers = headers or {}
+        self.retry_config = retry_config
+        self._retry_sleep = retry_sleep
+        self._instrumentation = instrumentation
+        self._propagate_trace_headers = propagate_trace_headers
 
         # 连接器配置参数（延迟到事件循环内创建，避免跨循环/跨线程问题）
         self._connector_params: dict[str, Any] = {
@@ -143,12 +228,11 @@ class HttpClient:
         }
 
         # 为不同事件循环维护独立的会话与连接器
-        self._sessions_by_loop: dict[int, ClientSession] = {}
-        self._connectors_by_loop: dict[int, aiohttp.TCPConnector] = {}
+        self._sessions_by_loop: dict[int, Any] = {}
+        self._connectors_by_loop: dict[int, Any] = {}
         self._loop_last_used: dict[int, float] = {}  # 记录每个循环最后使用时间
 
-        # 兼容旧字段，指向当前循环对应的会话（仅用于便捷访问）
-        self._session: ClientSession | None = None
+        self._session: Any | None = None
 
         self._closed = False
         self._request_count = 0
@@ -185,13 +269,12 @@ class HttpClient:
                 await old_connector.close()
 
         # 为当前事件循环创建新的连接器与会话
+        aiohttp = _load_aiohttp()
         connector = aiohttp.TCPConnector(**self._connector_params)
         timeout = (
-            ClientTimeout(total=self.default_timeout)
-            if self.default_timeout > 0
-            else None
+            aiohttp.ClientTimeout(total=self.default_timeout) if self.default_timeout > 0 else None
         )
-        session = ClientSession(
+        session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
             headers=self.default_headers,
@@ -243,9 +326,7 @@ class HttpClient:
                         self._loop_last_used.pop(loop_id, None)
 
                 if stale_loops:
-                    logger.info(
-                        f"HTTP客户端定期清理: 清除了 {len(stale_loops)} 个不活跃连接"
-                    )
+                    logger.info(f"HTTP客户端定期清理: 清除了 {len(stale_loops)} 个不活跃连接")
 
             except asyncio.CancelledError:
                 logger.debug("HTTP客户端清理任务被取消")
@@ -260,6 +341,39 @@ class HttpClient:
         if self.base_url:
             return urljoin(self.base_url + "/", url.lstrip("/"))
         return url
+
+    def _can_retry_method(self, method: str, retry_config: HttpRetryConfig | None) -> bool:
+        if retry_config is None:
+            return False
+        return retry_config.retry_all_methods or method.upper() in retry_config.retry_methods
+
+    def _should_retry_response(
+        self,
+        method: str,
+        response: HttpResponse,
+        retry_config: HttpRetryConfig | None,
+        attempt: int,
+    ) -> bool:
+        if retry_config is None or attempt >= retry_config.max_attempts:
+            return False
+        if not self._can_retry_method(method, retry_config):
+            return False
+        return response.status_code in retry_config.retry_status_codes
+
+    def _should_retry_exception(
+        self,
+        method: str,
+        retry_config: HttpRetryConfig | None,
+        attempt: int,
+    ) -> bool:
+        if retry_config is None or attempt >= retry_config.max_attempts:
+            return False
+        return self._can_retry_method(method, retry_config)
+
+    async def _sleep_before_retry(self, retry_config: HttpRetryConfig, attempt: int) -> None:
+        delay = retry_config.base_delay * (2 ** (attempt - 1))
+        if delay > 0:
+            await self._retry_sleep(delay)
 
     async def request(self, method: str, url: str, **kwargs) -> HttpResponse:
         """
@@ -277,6 +391,9 @@ class HttpClient:
             raise HttpError("HTTP客户端已关闭")
 
         await self._ensure_session()
+        session = self._session
+        if session is None:
+            raise HttpError("HTTP session is not initialized")
 
         # 构建完整URL
         full_url = self._build_url(url)
@@ -285,48 +402,136 @@ class HttpClient:
         headers = self.default_headers.copy()
         if "headers" in kwargs:
             headers.update(kwargs.pop("headers", {}))
+        if self._propagate_trace_headers:
+            self._attach_trace_headers(headers)
 
-        # 移除timeout参数避免冲突
-        if "timeout" in kwargs:
-            kwargs.pop("timeout")
+        retry_config = kwargs.pop("retry_config", self.retry_config)
+        timeout = kwargs.pop("timeout", None)
+        if timeout is not None:
+            kwargs["timeout"] = _load_aiohttp().ClientTimeout(total=timeout)
 
-        try:
+        attempt = 0
+        self._increment_metric("http_client_requests_total")
+        while True:
+            attempt += 1
             logger.debug(f"HTTP请求: {method} {full_url}")
 
-            # 增加请求计数
             self._request_count += 1
+            self._increment_metric("http_client_attempts_total")
+            start_time = time.monotonic()
 
-            async with self._session.request(
-                method, full_url, headers=headers, **kwargs
-            ) as response:
-                # 读取响应内容
-                content = await response.read()
-                text = await response.text()
+            try:
+                with self._span(
+                    "http.client.request",
+                    {
+                        "http.method": method.upper(),
+                        "http.url": full_url,
+                        "http.attempt": attempt,
+                    },
+                ):
+                    async with session.request(
+                        method, full_url, headers=headers, **kwargs
+                    ) as response:
+                        content = await response.read()
+                        text = await response.text()
 
-                http_response = HttpResponse(
-                    status_code=response.status,
-                    headers=dict(response.headers),
-                    text=text,
-                    content=content,
-                    url=str(response.url),
-                )
+                        http_response = HttpResponse(
+                            status_code=response.status,
+                            headers=dict(response.headers),
+                            text=text,
+                            content=content,
+                            url=str(response.url),
+                        )
 
-                logger.debug(f"HTTP响应: {response.status} {len(content)} bytes")
+                        self._record_response_metrics(method, response.status, start_time)
+                        logger.debug(f"HTTP响应: {response.status} {len(content)} bytes")
 
-                return http_response
+                        if self._should_retry_response(
+                            method, http_response, retry_config, attempt
+                        ):
+                            assert retry_config is not None
+                            self._increment_metric("http_client_retries_total")
+                            logger.warning(
+                                f"HTTP响应将重试: {method} {full_url} status={response.status} "
+                                f"attempt={attempt}/{retry_config.max_attempts}"
+                            )
+                            await self._sleep_before_retry(retry_config, attempt)
+                            continue
 
-        except TimeoutError as e:
-            logger.error(
-                f"HTTP请求超时: {method} {full_url}, 详细错误: {e}", exc_info=True
-            )
-            raise HttpError(f"请求超时: {method} {full_url}") from e
-        except aiohttp.ClientError as e:
-            logger.error(
-                f"HTTP请求失败: {method} {full_url}, 详细错误: {e}", exc_info=True
-            )
-            raise HttpError(f"请求失败: {str(e)}") from e
-        except Exception as e:
-            raise HttpError(f"请求异常: {str(e)}") from e
+                        return http_response
+
+            except TimeoutError as e:
+                self._record_error_metrics(method, start_time)
+                if self._should_retry_exception(method, retry_config, attempt):
+                    assert retry_config is not None
+                    self._increment_metric("http_client_retries_total")
+                    logger.warning(
+                        f"HTTP请求超时后重试: {method} {full_url} "
+                        f"attempt={attempt}/{retry_config.max_attempts}"
+                    )
+                    await self._sleep_before_retry(retry_config, attempt)
+                    continue
+                logger.error(f"HTTP请求超时: {method} {full_url}, 详细错误: {e}", exc_info=True)
+                raise HttpError(f"请求超时: {method} {full_url}") from e
+            except _load_aiohttp().ClientError as e:
+                self._record_error_metrics(method, start_time)
+                if self._should_retry_exception(method, retry_config, attempt):
+                    assert retry_config is not None
+                    self._increment_metric("http_client_retries_total")
+                    logger.warning(
+                        f"HTTP请求失败后重试: {method} {full_url} "
+                        f"attempt={attempt}/{retry_config.max_attempts} error={e}"
+                    )
+                    await self._sleep_before_retry(retry_config, attempt)
+                    continue
+                logger.error(f"HTTP请求失败: {method} {full_url}, 详细错误: {e}", exc_info=True)
+                raise HttpError(f"请求失败: {str(e)}") from e
+            except Exception as e:
+                self._record_error_metrics(method, start_time)
+                raise HttpError(f"请求异常: {str(e)}") from e
+
+    def _attach_trace_headers(self, headers: dict[str, str]) -> None:
+        trace_id = get_trace_id()
+        if trace_id and not _has_header(headers, TRACE_ID_HEADER):
+            headers[TRACE_ID_HEADER] = trace_id
+        request_id = get_request_id() or trace_id
+        if request_id and not _has_header(headers, REQUEST_ID_HEADER):
+            headers[REQUEST_ID_HEADER] = request_id
+
+    def _record_response_metrics(
+        self,
+        method: str,
+        status_code: int,
+        start_time: float,
+    ) -> None:
+        self._timing_metric("http_client_request_seconds", time.monotonic() - start_time)
+        self._increment_metric("http_client_responses_total")
+        self._increment_metric(f"http_client_status_{status_code}_total")
+        self._increment_metric(f"http_client_method_{method.upper().lower()}_total")
+
+    def _record_error_metrics(self, method: str, start_time: float) -> None:
+        self._timing_metric("http_client_request_seconds", time.monotonic() - start_time)
+        self._increment_metric("http_client_errors_total")
+        self._increment_metric(f"http_client_method_{method.upper().lower()}_errors_total")
+
+    def _increment_metric(self, name: str, amount: int = 1) -> None:
+        if self._instrumentation is not None:
+            self._instrumentation.increment(name, amount)
+
+    def _timing_metric(self, name: str, value: float) -> None:
+        if self._instrumentation is not None:
+            self._instrumentation.timing(name, value)
+
+    def _span(
+        self,
+        name: str,
+        attributes: dict[str, str | int | float | bool],
+    ) -> ContextManager[Any]:
+        if self._instrumentation is None:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return self._instrumentation.span(name, attributes)
 
     async def get(self, url: str, **kwargs) -> HttpResponse:
         """GET请求"""
@@ -364,6 +569,9 @@ class HttpClient:
             raise HttpError("HTTP客户端已关闭")
 
         await self._ensure_session()
+        session = self._session
+        if session is None:
+            raise HttpError("HTTP session is not initialized")
 
         full_url = self._build_url(url)
 
@@ -375,9 +583,7 @@ class HttpClient:
             # 计数
             self._request_count += 1
 
-            response = await self._session.post(
-                full_url, json=json, data=data, headers=request_headers
-            )
+            response = await session.post(full_url, json=json, data=data, headers=request_headers)
 
             if response.status != 200:
                 # 读取部分文本用于错误信息，随后释放连接
@@ -386,10 +592,8 @@ class HttpClient:
                 except Exception:
                     error_text = ""
                 finally:
-                    await response.release()
-                raise HttpError(
-                    f"请求失败: HTTP {response.status} - {error_text[:200]}"
-                )
+                    await _release_response(response)
+                raise HttpError(f"请求失败: HTTP {response.status} - {error_text[:200]}")
 
             async def _iter():
                 try:
@@ -400,21 +604,17 @@ class HttpClient:
                 finally:
                     # 确保连接被释放
                     try:
-                        await response.release()
+                        await _release_response(response)
                     except Exception:
                         pass
 
             return _iter()
 
         except TimeoutError as e:
-            logger.error(
-                f"HTTP流式请求超时: POST {full_url}, 详细错误: {e}", exc_info=True
-            )
+            logger.error(f"HTTP流式请求超时: POST {full_url}, 详细错误: {e}", exc_info=True)
             raise HttpError(f"请求超时: POST {full_url}") from e
-        except aiohttp.ClientError as e:
-            logger.error(
-                f"HTTP流式请求失败: POST {full_url}, 详细错误: {e}", exc_info=True
-            )
+        except _load_aiohttp().ClientError as e:
+            logger.error(f"HTTP流式请求失败: POST {full_url}, 详细错误: {e}", exc_info=True)
             raise HttpError(f"请求失败: {str(e)}") from e
         except Exception as e:
             raise HttpError(f"请求异常: {str(e)}") from e
@@ -443,9 +643,7 @@ class HttpClient:
         session_count = len(self._sessions_by_loop)
         connector_count = len(self._connectors_by_loop)
 
-        logger.debug(
-            f"开始关闭HTTP客户端: {session_count}个会话, {connector_count}个连接器"
-        )
+        logger.debug(f"开始关闭HTTP客户端: {session_count}个会话, {connector_count}个连接器")
 
         # 逐个关闭会话
         for loop_id, session in list(self._sessions_by_loop.items()):
@@ -509,9 +707,7 @@ class HttpClient:
         if hasattr(connector, "_acquired"):
             connector_stats["acquired_connections"] = len(connector._acquired)
         if hasattr(connector, "_available_connections"):
-            connector_stats["available_connections"] = len(
-                connector._available_connections
-            )
+            connector_stats["available_connections"] = len(connector._available_connections)
 
         return {
             "in_event_loop": True,
@@ -537,95 +733,84 @@ class HttpClient:
             else:
                 return {
                     "healthy": not self._closed,
-                    "session_active": self._session is not None
-                    and not self._session.closed,
+                    "session_active": self._session is not None and not self._session.closed,
                     **self.get_connection_stats(),
                 }
         except Exception as e:
             return {"healthy": False, "error": str(e), **self.get_connection_stats()}
 
 
-class HttpClientManager:
-    """
-    HTTP客户端管理器
+class MockHttpClient:
+    """Deterministic HTTP client for local development and generated tests."""
 
-    管理全局的HTTP客户端实例，提供单例和工厂模式
-    """
+    def __init__(
+        self,
+        *,
+        base_url: str = "mock://http",
+        status_code: int = 200,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/") if base_url else "mock://http"
+        self.status_code = status_code
+        self.body = body or {"ok": True}
+        self.headers = headers or {"Content-Type": "application/json"}
+        self.requests: list[dict[str, Any]] = []
+        self.closed = False
 
-    _instances: dict[str, HttpClient] = {}
+    async def request(self, method: str, url: str, **kwargs: Any) -> HttpResponse:
+        if self.closed:
+            raise HttpError("HTTP客户端已关闭")
+        full_url = self._build_url(url)
+        request = {
+            "method": method.upper(),
+            "url": full_url,
+            "headers": dict(kwargs.get("headers") or {}),
+            "params": kwargs.get("params"),
+            "json": kwargs.get("json"),
+            "data": kwargs.get("data"),
+        }
+        self.requests.append(request)
+        payload = {
+            **self.body,
+            "request": {
+                "method": request["method"],
+                "url": request["url"],
+            },
+        }
+        text = _orjson_dumps(payload)
+        return HttpResponse(
+            status_code=self.status_code,
+            headers=dict(self.headers),
+            text=text,
+            content=text.encode("utf-8"),
+            url=full_url,
+        )
 
-    @classmethod
-    def get_client(
-        cls, name: str = "default", base_url: str = "", **kwargs
-    ) -> HttpClient:
-        """
-        获取HTTP客户端实例
+    def _build_url(self, url: str) -> str:
+        if url.startswith(("http://", "https://", "mock://")):
+            return url
+        if self.base_url.startswith("mock://"):
+            return f"{self.base_url}/{url.lstrip('/')}"
+        return urljoin(self.base_url + "/", url.lstrip("/"))
 
-        Args:
-            name: 客户端名称，用于区分不同的客户端
-            base_url: 基础URL
-            **kwargs: 客户端配置参数
+    async def get(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("GET", url, **kwargs)
 
-        Returns:
-            HTTP客户端实例
-        """
-        if name not in cls._instances:
-            cls._instances[name] = HttpClient(base_url=base_url, **kwargs)
-        return cls._instances[name]
+    async def post(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("POST", url, **kwargs)
 
-    @classmethod
-    async def close_all(cls):
-        """关闭所有客户端"""
-        for client in cls._instances.values():
-            await client.close()
-        cls._instances.clear()
-        logger.info("所有HTTP客户端已关闭")
+    async def put(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("PUT", url, **kwargs)
 
-    @classmethod
-    def get_all_stats(cls) -> dict[str, dict[str, Any]]:
-        """获取所有客户端的统计信息"""
-        stats = {}
-        for name, client in cls._instances.items():
-            stats[name] = client.get_connection_stats()
-        return stats
+    async def delete(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("DELETE", url, **kwargs)
 
-    @classmethod
-    async def health_check_all(cls) -> dict[str, dict[str, Any]]:
-        """对所有客户端进行健康检查"""
-        health_status = {}
-        for name, client in cls._instances.items():
-            try:
-                health_status[name] = await client.health_check()
-            except Exception as e:
-                health_status[name] = {"healthy": False, "error": str(e)}
-        return health_status
+    async def patch(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("PATCH", url, **kwargs)
 
-    @classmethod
-    def list_clients(cls) -> list[str]:
-        """列出所有客户端名称"""
-        return list(cls._instances.keys())
+    async def close(self) -> None:
+        self.closed = True
 
-
-# 便捷函数
-async def get(url: str, **kwargs) -> HttpResponse:
-    """便捷GET请求"""
-    client = HttpClientManager.get_client()
-    return await client.get(url, **kwargs)
-
-
-async def post(url: str, **kwargs) -> HttpResponse:
-    """便捷POST请求"""
-    client = HttpClientManager.get_client()
-    return await client.post(url, **kwargs)
-
-
-async def put(url: str, **kwargs) -> HttpResponse:
-    """便捷PUT请求"""
-    client = HttpClientManager.get_client()
-    return await client.put(url, **kwargs)
-
-
-async def delete(url: str, **kwargs) -> HttpResponse:
-    """便捷DELETE请求"""
-    client = HttpClientManager.get_client()
-    return await client.delete(url, **kwargs)
+    async def health_check(self) -> dict[str, Any]:
+        return {"healthy": not self.closed, "provider": "mock"}

@@ -3,6 +3,8 @@ from infra.plugins.ai.models import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
+    EmbeddingRequest,
+    EmbeddingResponse,
     Role,
     ToolCall,
     ToolDefinition,
@@ -10,7 +12,6 @@ from infra.plugins.ai.models import (
 from infra.plugins.ai.plugin import AIPlugin
 from infra.plugins.ai.providers.base import AIProvider
 from infra.plugins.ai.registry import AIRegistry
-
 
 __all__ = [
     "AIPlugin",
@@ -20,6 +21,8 @@ __all__ = [
     "ChatMessage",
     "ChatRequest",
     "ChatResponse",
+    "EmbeddingRequest",
+    "EmbeddingResponse",
     "Role",
     "ToolDefinition",
     "ToolCall",

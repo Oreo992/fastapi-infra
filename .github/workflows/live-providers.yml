@@ -1,0 +1,250 @@
+name: Live Providers
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Optional provider check name. Empty means all providers."
+        required: false
+        type: string
+
+jobs:
+  certify:
+    name: Certify live providers
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package with live provider extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,live-providers]"
+
+      - name: Generate provider environment template
+        run: |
+          provider_args=()
+          if [ -n "${{ inputs.provider }}" ]; then
+            provider_args+=(--provider "${{ inputs.provider }}")
+          fi
+          if [ "${#provider_args[@]}" -gt 0 ]; then
+            fastapi-infra certify-providers "${provider_args[@]}" --env-template > provider-env-template.env
+          else
+            fastapi-infra certify-providers --env-template > provider-env-template.env
+          fi
+
+      - name: Generate release check settings
+        run: |
+          python - <<'PY'
+          import json
+          from infra.provider_certification import selected_checks
+
+          all_providers = {
+              "mysql",
+              "redis",
+              "stripe",
+              "s3",
+              "openai-ai",
+              "anthropic-ai",
+              "gemini-ai",
+              "openai-speech",
+              "smtp",
+          }
+          selected = (
+              {check.name for check in selected_checks(["${{ inputs.provider }}"])}
+              if "${{ inputs.provider }}"
+              else all_providers
+          )
+          plugins = {}
+
+          if {"mysql", "redis", "stripe"} & selected:
+              plugins["database"] = {
+                  "enabled": True,
+                  "config": {
+                      "connect_on_startup": True,
+                      "config": {
+                          "mysql_enabled": "mysql" in selected,
+                          "mysql_host": "live-certification.example",
+                          "mysql_user": "live-certification",
+                          "mysql_password": "live-certification",
+                          "mysql_db": "live_certification",
+                          "redis_enabled": "redis" in selected,
+                          "redis_url": "redis://live-certification.example:6379/0",
+                      },
+                  },
+              }
+
+          if "redis" in selected:
+              plugins["cache"] = {
+                  "enabled": True,
+                  "config": {"database_service": "database"},
+              }
+
+          ai_provider = None
+          for candidate in ("openai-ai", "anthropic-ai", "gemini-ai"):
+              if candidate in selected:
+                  ai_provider = candidate.replace("-ai", "")
+                  break
+          if ai_provider is not None:
+              plugins["ai"] = {
+                  "enabled": True,
+                  "config": {
+                      "default_provider": ai_provider,
+                      "health_probe": True,
+                      "providers": {ai_provider: {"api_key": "live-certification"}},
+                  },
+              }
+
+          if "stripe" in selected:
+              plugins["payment"] = {
+                  "enabled": True,
+                  "config": {
+                      "default_provider": "stripe",
+                      "health_probe": True,
+                      "store_service": "database",
+                      "providers": {
+                          "stripe": {
+                              "api_key": "live-certification",
+                              "webhook_secret": "live-certification",
+                          }
+                      },
+                  },
+              }
+
+          if "s3" in selected:
+              plugins["storage"] = {
+                  "enabled": True,
+                  "config": {
+                      "default_provider": "s3",
+                      "health_probe": True,
+                      "providers": {
+                          "s3": {
+                              "bucket": "live-certification",
+                              "region": "us-east-1",
+                              "access_key_id": "live-certification",
+                              "secret_access_key": "live-certification",
+                          }
+                      },
+                  },
+              }
+
+          if "openai-speech" in selected:
+              plugins["speech"] = {
+                  "enabled": True,
+                  "config": {
+                      "default_provider": "openai",
+                      "health_probe": True,
+                      "providers": {"openai": {"api_key": "live-certification"}},
+                  },
+              }
+
+          if "smtp" in selected:
+              plugins["notifications"] = {
+                  "enabled": True,
+                  "config": {
+                      "default_provider": "smtp",
+                      "health_probe": True,
+                      "providers": {
+                          "smtp": {
+                              "host": "smtp.live-certification.example",
+                              "sender": "noreply@live-certification.example",
+                          }
+                      },
+                  },
+              }
+
+          with open("provider-release-settings.json", "w", encoding="utf-8") as handle:
+              json.dump({"infra": {"plugins": plugins}}, handle, indent=2, sort_keys=True)
+          PY
+
+      - name: Run provider certification
+        env:
+          MYSQL_LIVE_HOST: ${{ secrets.MYSQL_LIVE_HOST }}
+          MYSQL_LIVE_PORT: ${{ secrets.MYSQL_LIVE_PORT }}
+          MYSQL_LIVE_USER: ${{ secrets.MYSQL_LIVE_USER }}
+          MYSQL_LIVE_PASSWORD: ${{ secrets.MYSQL_LIVE_PASSWORD }}
+          MYSQL_LIVE_DB: ${{ secrets.MYSQL_LIVE_DB }}
+          MYSQL_LIVE_CONNECT_TIMEOUT: ${{ vars.MYSQL_LIVE_CONNECT_TIMEOUT }}
+          REDIS_LIVE_URL: ${{ secrets.REDIS_LIVE_URL }}
+          REDIS_LIVE_CONNECT_TIMEOUT: ${{ vars.REDIS_LIVE_CONNECT_TIMEOUT }}
+          STRIPE_API_KEY: ${{ secrets.STRIPE_API_KEY }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+          STRIPE_API_BASE: ${{ vars.STRIPE_API_BASE }}
+          STRIPE_LIVE_TIMEOUT: ${{ vars.STRIPE_LIVE_TIMEOUT }}
+          S3_LIVE_BUCKET: ${{ secrets.S3_LIVE_BUCKET }}
+          S3_LIVE_REGION: ${{ secrets.S3_LIVE_REGION }}
+          S3_LIVE_ACCESS_KEY_ID: ${{ secrets.S3_LIVE_ACCESS_KEY_ID }}
+          S3_LIVE_SECRET_ACCESS_KEY: ${{ secrets.S3_LIVE_SECRET_ACCESS_KEY }}
+          S3_LIVE_ENDPOINT_URL: ${{ secrets.S3_LIVE_ENDPOINT_URL }}
+          S3_LIVE_FORCE_PATH_STYLE: ${{ secrets.S3_LIVE_FORCE_PATH_STYLE }}
+          S3_LIVE_PREFIX: ${{ vars.S3_LIVE_PREFIX }}
+          S3_LIVE_TIMEOUT: ${{ vars.S3_LIVE_TIMEOUT }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ vars.OPENAI_API_BASE }}
+          OPENAI_LIVE_CHAT_MODEL: ${{ vars.OPENAI_LIVE_CHAT_MODEL }}
+          OPENAI_LIVE_EMBEDDING_MODEL: ${{ vars.OPENAI_LIVE_EMBEDDING_MODEL }}
+          OPENAI_LIVE_TIMEOUT: ${{ vars.OPENAI_LIVE_TIMEOUT }}
+          OPENAI_ASR_MODEL: ${{ vars.OPENAI_ASR_MODEL }}
+          OPENAI_TTS_MODEL: ${{ vars.OPENAI_TTS_MODEL }}
+          OPENAI_VOICE: ${{ vars.OPENAI_VOICE }}
+          OPENAI_SPEECH_TIMEOUT: ${{ vars.OPENAI_SPEECH_TIMEOUT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_BASE: ${{ vars.ANTHROPIC_API_BASE }}
+          ANTHROPIC_LIVE_CHAT_MODEL: ${{ vars.ANTHROPIC_LIVE_CHAT_MODEL }}
+          ANTHROPIC_LIVE_TIMEOUT: ${{ vars.ANTHROPIC_LIVE_TIMEOUT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_BASE: ${{ vars.GEMINI_API_BASE }}
+          GEMINI_LIVE_CHAT_MODEL: ${{ vars.GEMINI_LIVE_CHAT_MODEL }}
+          GEMINI_LIVE_EMBEDDING_MODEL: ${{ vars.GEMINI_LIVE_EMBEDDING_MODEL }}
+          GEMINI_LIVE_TIMEOUT: ${{ vars.GEMINI_LIVE_TIMEOUT }}
+          SMTP_LIVE_HOST: ${{ secrets.SMTP_LIVE_HOST }}
+          SMTP_LIVE_PORT: ${{ secrets.SMTP_LIVE_PORT }}
+          SMTP_LIVE_SENDER: ${{ secrets.SMTP_LIVE_SENDER }}
+          SMTP_LIVE_USERNAME: ${{ secrets.SMTP_LIVE_USERNAME }}
+          SMTP_LIVE_PASSWORD: ${{ secrets.SMTP_LIVE_PASSWORD }}
+          SMTP_LIVE_RECIPIENT: ${{ secrets.SMTP_LIVE_RECIPIENT }}
+          SMTP_LIVE_USE_TLS: ${{ vars.SMTP_LIVE_USE_TLS }}
+          SMTP_LIVE_TIMEOUT: ${{ vars.SMTP_LIVE_TIMEOUT }}
+        run: |
+          set -uo pipefail
+          provider_args=()
+          if [ -n "${{ inputs.provider }}" ]; then
+            provider_args+=(--provider "${{ inputs.provider }}")
+          fi
+          if [ "${#provider_args[@]}" -gt 0 ]; then
+            fastapi-infra certify-providers "${provider_args[@]}" --preflight --json > provider-preflight.json
+            preflight_status=$?
+            fastapi-infra certify-providers "${provider_args[@]}" --json > provider-certification.json
+            certification_status=$?
+          else
+            fastapi-infra certify-providers --preflight --json > provider-preflight.json
+            preflight_status=$?
+            fastapi-infra certify-providers --json > provider-certification.json
+            certification_status=$?
+          fi
+          fastapi-infra release-check \
+            --settings provider-release-settings.json \
+            --provider-certification-report provider-certification.json \
+            --json > release-check.json
+          release_status=$?
+          if [ "$preflight_status" -ne 0 ] || [ "$certification_status" -ne 0 ] || [ "$release_status" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload certification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-certification
+          if-no-files-found: warn
+          path: |
+            provider-preflight.json
+            provider-certification.json
+            release-check.json
+            provider-env-template.env

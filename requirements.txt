@@ -12,19 +12,12 @@ uvloop==0.21.0; platform_system != "Windows"
 pydantic==2.11.9
 pydantic-settings==2.10.1
 
-# Database
-aiomysql==0.2.0
-redis==6.4.0
-
-# HTTP Client
-aiohttp==3.12.15
-httpx==0.25.2
-
-# Serialization
-orjson==3.10.7
-
 # Logging
 loguru==0.7.3
 
-# System
-psutil==7.1.0
+# Optional integrations are installed through pyproject extras:
+# - fastapi-infra[mysql]
+# - fastapi-infra[redis]
+# - fastapi-infra[http]
+# - fastapi-infra[ai]
+# - fastapi-infra[observability]

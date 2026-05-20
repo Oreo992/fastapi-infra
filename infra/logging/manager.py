@@ -16,18 +16,17 @@ from typing import Any
 
 from loguru import logger
 
-
 # 上下文变量用于追踪
 trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
+request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 user_id_var: ContextVar[str | None] = ContextVar("user_id", default=None)
-request_data_var: ContextVar[dict[str, Any] | None] = ContextVar(
-    "request_data", default=None
-)
+request_data_var: ContextVar[dict[str, Any] | None] = ContextVar("request_data", default=None)
 
 
-def _context_patcher(record: dict) -> None:
+def _context_patcher(record: Any) -> None:
     """自动将 trace_id/user_id 从 ContextVar 注入到每条日志的 extra 字段。"""
     record["extra"].setdefault("trace_id", trace_id_var.get(None) or "-")
+    record["extra"].setdefault("request_id", request_id_var.get(None) or "-")
     record["extra"].setdefault("user_id", user_id_var.get(None) or "-")
 
 
@@ -64,17 +63,17 @@ def _make_rotation_check(max_bytes: int = 100 * 1024 * 1024):
 
 class LoggerManager:
     """日志管理器
-    
+
     使用方式：
         config = {
             "log_level": "INFO",
             "log_format": "pretty",  # 或 "json"
             "environment": "development",  # 或 "production"
         }
-        log_manager = LoggerManager(config)
+        manager = LoggerManager(config)
     """
 
-    def __init__(self, config: dict = None) -> None:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
         self._config = config or {}
         self._setup_logging()
 
@@ -166,9 +165,7 @@ class LoggerManager:
                     frame = frame.f_back
                     depth += 1
 
-                logger.opt(depth=depth, exception=record.exc_info).log(
-                    level, record.getMessage()
-                )
+                logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
 
         logging.root.handlers = [InterceptHandler()]
         logging.root.setLevel(0)
@@ -208,12 +205,28 @@ class LoggerManager:
     def reset_context(self):
         """重置所有上下文变量，避免内存泄漏"""
         trace_id_var.set(None)
+        request_id_var.set(None)
         user_id_var.set(None)
         request_data_var.set(None)
 
     def clear_trace_id(self):
         """清除追踪ID"""
         trace_id_var.set(None)
+
+    def set_request_id(self, request_id: str | None = None) -> str:
+        """设置请求ID"""
+        if not request_id:
+            request_id = str(uuid.uuid4())
+        request_id_var.set(request_id)
+        return request_id
+
+    def get_request_id(self) -> str | None:
+        """获取当前请求ID"""
+        return request_id_var.get(None)
+
+    def clear_request_id(self):
+        """清除请求ID"""
+        request_id_var.set(None)
 
     def clear_user_id(self):
         """清除用户ID"""
@@ -232,38 +245,41 @@ class LoggerManager:
     ):
         """上下文管理器，自动管理日志上下文的生命周期"""
         old_trace_token = None
-        old_user_token = None
         old_request_token = None
+        old_user_token = None
+        old_request_data_token = None
 
         try:
             if trace_id is not None:
                 old_trace_token = trace_id_var.set(trace_id)
+            request_id = request_data.get("request_id") if request_data is not None else None
+            if isinstance(request_id, str):
+                old_request_token = request_id_var.set(request_id)
             if user_id is not None:
                 old_user_token = user_id_var.set(user_id)
             if request_data is not None:
-                old_request_token = request_data_var.set(request_data)
+                old_request_data_token = request_data_var.set(request_data)
 
             yield
 
         finally:
             if old_trace_token is not None:
                 trace_id_var.reset(old_trace_token)
+            if old_request_token is not None:
+                request_id_var.reset(old_request_token)
             if old_user_token is not None:
                 user_id_var.reset(old_user_token)
-            if old_request_token is not None:
-                request_data_var.reset(old_request_token)
+            if old_request_data_token is not None:
+                request_data_var.reset(old_request_data_token)
 
     def get_current_context(self) -> dict[str, Any]:
         """获取当前所有上下文信息"""
         return {
             "trace_id": self.get_trace_id(),
+            "request_id": self.get_request_id(),
             "user_id": self.get_user_id(),
             "request_data": self.get_request_data(),
         }
-
-
-# 全局日志管理器
-log_manager = LoggerManager()
 
 
 def get_logger(name: str | None = None) -> Any:
@@ -273,36 +289,101 @@ def get_logger(name: str | None = None) -> Any:
     return logger
 
 
-# 辅助函数，方便使用
+def setup_logging(config: dict | None = None) -> LoggerManager:
+    """显式配置日志系统并返回管理器实例。"""
+    return LoggerManager(config)
+
+
+def set_trace_id(trace_id: str | None = None) -> str:
+    """设置追踪ID"""
+    if not trace_id:
+        trace_id = str(uuid.uuid4())
+    trace_id_var.set(trace_id)
+    return trace_id
+
+
+def set_request_id(request_id: str | None = None) -> str:
+    """设置请求ID"""
+    if not request_id:
+        request_id = str(uuid.uuid4())
+    request_id_var.set(request_id)
+    return request_id
+
+
+def set_user_id(user_id: str) -> None:
+    """设置用户ID"""
+    user_id_var.set(user_id)
+
+
 def set_log_context(
     trace_id: str | None = None,
+    request_id: str | None = None,
     user_id: str | None = None,
     request_data: dict[str, Any] | None = None,
-):
+) -> None:
     """设置日志上下文"""
     if trace_id is not None:
-        log_manager.set_trace_id(trace_id)
+        trace_id_var.set(trace_id)
+    if request_id is not None:
+        request_id_var.set(request_id)
     if user_id is not None:
-        log_manager.set_user_id(user_id)
+        user_id_var.set(user_id)
     if request_data is not None:
-        log_manager.set_request_data(request_data)
+        request_data_var.set(request_data)
 
 
-def clear_log_context():
+def clear_log_context() -> None:
     """清除日志上下文，防止内存泄漏"""
-    log_manager.reset_context()
+    trace_id_var.set(None)
+    request_id_var.set(None)
+    user_id_var.set(None)
+    request_data_var.set(None)
 
 
 def get_trace_id() -> str | None:
     """获取当前追踪ID"""
-    return log_manager.get_trace_id()
+    return trace_id_var.get(None)
 
 
+def get_request_id() -> str | None:
+    """获取当前请求ID"""
+    return request_id_var.get(None)
+
+
+def get_user_id() -> str | None:
+    """获取当前用户ID"""
+    return user_id_var.get(None)
+
+
+@contextmanager
 def log_context(
     trace_id: str | None = None,
+    request_id: str | None = None,
     user_id: str | None = None,
     request_data: dict[str, Any] | None = None,
 ):
     """日志上下文管理器"""
-    return log_manager.log_context(trace_id, user_id, request_data)
+    old_trace_token = None
+    old_request_token = None
+    old_user_token = None
+    old_request_data_token = None
 
+    try:
+        if trace_id is not None:
+            old_trace_token = trace_id_var.set(trace_id)
+        if request_id is not None:
+            old_request_token = request_id_var.set(request_id)
+        if user_id is not None:
+            old_user_token = user_id_var.set(user_id)
+        if request_data is not None:
+            old_request_data_token = request_data_var.set(request_data)
+        yield
+    finally:
+        if old_trace_token is not None:
+            trace_id_var.reset(old_trace_token)
+        if old_request_token is not None:
+            request_id_var.reset(old_request_token)
+        if old_user_token is not None:
+            user_id_var.reset(old_user_token)
+        if old_request_data_token is not None:
+            request_data_var.reset(old_request_data_token)

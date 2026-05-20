@@ -1,0 +1,11 @@
+prune .github
+prune build
+prune dist
+prune docs
+prune examples
+prune scripts
+prune tests
+
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store

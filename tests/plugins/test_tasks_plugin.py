@@ -1,14 +1,17 @@
+from typing import cast
+
 import pytest
 
 from infra.config.models import InfraSettings
 from infra.core.health import HealthState
 from infra.plugins.contract import PluginContext, PluginMetadata
-from infra.plugins.manager import PluginManager
+from infra.plugins.manager import PluginDependencyError, PluginManager
 from infra.plugins.tasks import (
     MemoryTaskQueue,
     RedisStreamTaskQueue,
-    TaskState,
+    TaskQueueBackendRegistry,
     TasksPlugin,
+    TaskState,
 )
 
 
@@ -16,11 +19,17 @@ class FakeRedis:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
         self.hashes: dict[str, dict[str, str]] = {}
+        self.values: dict[str, str] = {}
         self.streams: dict[str, list[tuple[str, dict[str, str]]]] = {}
         self.groups: dict[tuple[str, str], int] = {}
         self.pending: dict[tuple[str, str], list[dict[str, object]]] = {}
         self.fail_busygroup = False
+        self.ping_ok = True
         self._next_id = 1
+
+    async def ping(self) -> bool:
+        self.calls.append(("ping", (), {}))
+        return self.ping_ok
 
     async def hset(self, name: str, mapping: dict[str, str]) -> None:
         self.calls.append(("hset", (name,), {"mapping": mapping}))
@@ -29,6 +38,17 @@ class FakeRedis:
     async def hgetall(self, name: str) -> dict[str, str]:
         self.calls.append(("hgetall", (name,), {}))
         return dict(self.hashes[name])
+
+    async def get(self, name: str) -> str | None:
+        self.calls.append(("get", (name,), {}))
+        return self.values.get(name)
+
+    async def set(self, name: str, value: str, nx: bool = False) -> bool:
+        self.calls.append(("set", (name, value), {"nx": nx}))
+        if nx and name in self.values:
+            return False
+        self.values[name] = value
+        return True
 
     async def xadd(self, name: str, fields: dict[str, str]) -> str:
         self.calls.append(("xadd", (name,), {"fields": fields}))
@@ -117,9 +137,11 @@ class FakeRedis:
         for entry in self.pending.get((name, groupname), []):
             if len(messages) >= count:
                 break
-            if int(entry["idle"]) >= min_idle_time:
+            idle = cast(int, entry["idle"])
+            fields = cast(dict[str, str], entry["fields"])
+            if idle >= min_idle_time:
                 entry["consumer"] = consumername
-                messages.append((str(entry["message_id"]), dict(entry["fields"])))
+                messages.append((str(entry["message_id"]), dict(fields)))
         return ("0-0", messages)
 
     async def xack(self, name: str, groupname: str, *ids: str) -> int:
@@ -139,7 +161,7 @@ class FakeDatabaseService:
     def __init__(self, redis: FakeRedis) -> None:
         self.redis = redis
 
-    async def _get_or_create_redis_client(self) -> FakeRedis:
+    async def get_redis_client(self) -> FakeRedis:
         return self.redis
 
 
@@ -163,6 +185,61 @@ class FakeDatabasePlugin:
         return ctx.health_status("database", HealthState.HEALTHY)
 
 
+class FakeTaskEntryPoint:
+    def __init__(self, name: str, loaded: object) -> None:
+        self.name = name
+        self.loaded = loaded
+
+    def load(self) -> object:
+        return self.loaded
+
+
+class CustomTaskQueue:
+    name = "custom"
+
+    def __init__(self, config):
+        self.config = dict(config)
+        self.tasks = {}
+
+    async def enqueue(
+        self,
+        name,
+        payload=None,
+        *,
+        idempotency_key=None,
+        delay_seconds=0,
+        max_attempts=1,
+    ):
+        from infra.plugins.tasks.models import TaskEnvelope
+
+        task = TaskEnvelope(
+            name=name,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+        )
+        self.tasks[task.id] = task
+        return task
+
+    async def dequeue(self):
+        return None
+
+    async def complete(self, task_id):
+        return None
+
+    async def fail(self, task_id, reason):
+        return None
+
+    async def retry(self, task_id, reason, *, delay_seconds=0):
+        return None
+
+    async def dead_letter(self, task_id, reason):
+        return None
+
+    def get(self, task_id):
+        return self.tasks[task_id]
+
+
 @pytest.mark.asyncio
 async def test_memory_task_queue_tracks_complete_and_failed_tasks():
     queue = MemoryTaskQueue()
@@ -175,7 +252,7 @@ async def test_memory_task_queue_tracks_complete_and_failed_tasks():
     assert second.payload is None
 
     dequeued_first = await queue.dequeue()
-    assert dequeued_first == first.model_copy(update={"state": "running"})
+    assert dequeued_first == first.model_copy(update={"state": "running", "attempts": 1})
     assert queue.get(first.id).state == "running"
 
     await queue.complete(first.id)
@@ -190,6 +267,69 @@ async def test_memory_task_queue_tracks_complete_and_failed_tasks():
     assert failed.state == "failed"
     assert failed.error == "network timeout"
     assert await queue.dequeue() is None
+
+
+@pytest.mark.asyncio
+async def test_memory_task_queue_retries_after_backoff_and_dead_letters():
+    now = 1000.0
+    queue = MemoryTaskQueue(now=lambda: now)
+    task = await queue.enqueue("sync_account", max_attempts=2)
+
+    first = await queue.dequeue()
+    assert first == task.model_copy(update={"state": "running", "attempts": 1})
+
+    await queue.retry(task.id, "temporary outage", delay_seconds=30)
+    queued = queue.get(task.id)
+    assert queued.state == "queued"
+    assert queued.error == "temporary outage"
+    assert queued.available_at == 1030.0
+    assert await queue.dequeue() is None
+
+    now = 1030.0
+    second = await queue.dequeue()
+    assert second is not None
+    assert second.attempts == 2
+
+    await queue.dead_letter(task.id, "permanent outage")
+    dead = queue.get(task.id)
+    assert dead.state == "dead_lettered"
+    assert dead.error == "permanent outage"
+
+
+@pytest.mark.asyncio
+async def test_memory_task_queue_deduplicates_by_idempotency_key_and_delays_initial_delivery():
+    now = 1000.0
+    queue = MemoryTaskQueue(now=lambda: now)
+
+    first = await queue.enqueue(
+        "sync_account",
+        {"account_id": "a"},
+        idempotency_key=" account:a ",
+        delay_seconds=15,
+    )
+    duplicate = await queue.enqueue(
+        "sync_account",
+        {"account_id": "a"},
+        idempotency_key="account:a",
+    )
+
+    assert duplicate == first
+    assert first.idempotency_key == "account:a"
+    assert first.available_at == 1015.0
+    assert await queue.dequeue() is None
+
+    now = 1015.0
+    dequeued = await queue.dequeue()
+    assert dequeued == first.model_copy(update={"state": "running", "attempts": 1})
+    assert await queue.dequeue() is None
+
+
+@pytest.mark.asyncio
+async def test_memory_task_queue_rejects_blank_idempotency_key():
+    queue = MemoryTaskQueue()
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        await queue.enqueue("sync_account", idempotency_key=" ")
 
 
 @pytest.mark.asyncio
@@ -209,10 +349,13 @@ async def test_redis_stream_task_queue_tracks_task_lifecycle_with_json_fields():
     stored = hset_call[2]["mapping"]
     assert stored["name"] == '"send_email"'
     assert stored["payload"] == '{"to":"user@example.com"}'
+    assert stored["idempotency_key"] == "null"
     assert stored["state"] == '"queued"'
+    assert stored["attempts"] == "0"
+    assert stored["max_attempts"] == "1"
 
     dequeued = await queue.dequeue()
-    assert dequeued == task.model_copy(update={"state": "running"})
+    assert dequeued == task.model_copy(update={"state": "running", "attempts": 1})
     assert queue.get(task.id).state == "running"
     xgroup_call = next(call for call in redis.calls if call[0] == "xgroup_create")
     assert xgroup_call[1] == ("test:tasks", "tests", "0")
@@ -246,7 +389,7 @@ async def test_redis_stream_task_queue_tolerates_existing_consumer_group():
 
     task = await queue.enqueue("send_email")
 
-    assert await queue.dequeue() == task.model_copy(update={"state": "running"})
+    assert await queue.dequeue() == task.model_copy(update={"state": "running", "attempts": 1})
 
 
 @pytest.mark.asyncio
@@ -259,7 +402,9 @@ async def test_redis_stream_task_queue_recovers_stale_pending_task():
         pending_min_idle_ms=5000,
     )
     task = await first_queue.enqueue("send_email")
-    assert await first_queue.dequeue() == task.model_copy(update={"state": "running"})
+    assert await first_queue.dequeue() == task.model_copy(
+        update={"state": "running", "attempts": 1}
+    )
     redis.age_pending("test:tasks", "tests", idle=5000)
 
     recovery_queue = RedisStreamTaskQueue(
@@ -271,7 +416,7 @@ async def test_redis_stream_task_queue_recovers_stale_pending_task():
 
     recovered = await recovery_queue.dequeue()
 
-    assert recovered == task.model_copy(update={"state": "running"})
+    assert recovered == task.model_copy(update={"state": "running", "attempts": 2})
     assert recovery_queue.get(task.id).state == "running"
     assert [call[0] for call in redis.calls].count("xautoclaim") >= 1
 
@@ -292,8 +437,93 @@ async def test_redis_stream_task_queue_get_async_loads_persisted_state_for_new_i
     assert new_queue.get(task.id) == task
 
 
+@pytest.mark.asyncio
+async def test_redis_stream_task_queue_retries_with_delayed_delivery():
+    now = 1000.0
+    redis = FakeRedis()
+    queue = RedisStreamTaskQueue(
+        redis,
+        stream_name="test:tasks",
+        consumer_group="tests",
+        now=lambda: now,
+    )
+    task = await queue.enqueue("sync_account", max_attempts=2)
+
+    first = await queue.dequeue()
+    assert first == task.model_copy(update={"state": "running", "attempts": 1})
+
+    await queue.retry(task.id, "temporary outage", delay_seconds=30)
+    retried = queue.get(task.id)
+    assert retried.state == "queued"
+    assert retried.error == "temporary outage"
+    assert retried.available_at == 1030.0
+
+    assert await queue.dequeue() is None
+
+    now = 1030.0
+    second = await queue.dequeue()
+    assert second is not None
+    assert second.state == "running"
+    assert second.attempts == 2
+
+    await queue.dead_letter(task.id, "permanent outage")
+    dead = queue.get(task.id)
+    assert dead.state == "dead_lettered"
+    assert dead.error == "permanent outage"
+
+
+@pytest.mark.asyncio
+async def test_redis_stream_task_queue_deduplicates_by_idempotency_key_and_delays_initial_delivery():
+    now = 1000.0
+    redis = FakeRedis()
+    queue = RedisStreamTaskQueue(
+        redis,
+        stream_name="test:tasks",
+        consumer_group="tests",
+        now=lambda: now,
+    )
+
+    first = await queue.enqueue(
+        "sync_account",
+        {"account_id": "a"},
+        idempotency_key=" account:a ",
+        delay_seconds=15,
+    )
+    duplicate = await queue.enqueue(
+        "sync_account",
+        {"account_id": "a"},
+        idempotency_key="account:a",
+    )
+
+    assert duplicate == first
+    assert first.idempotency_key == "account:a"
+    assert first.available_at == 1015.0
+    assert redis.values["test:tasks:idempotency:account:a"] == first.id
+    assert [call[0] for call in redis.calls].count("xadd") == 1
+    assert await queue.dequeue() is None
+
+    now = 1015.0
+    dequeued = await queue.dequeue()
+    assert dequeued == first.model_copy(update={"state": "running", "attempts": 1})
+
+
+@pytest.mark.asyncio
+async def test_redis_stream_task_queue_rejects_blank_idempotency_key():
+    redis = FakeRedis()
+    queue = RedisStreamTaskQueue(redis)
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        await queue.enqueue("sync_account", idempotency_key=" ")
+
+
 def test_task_state_literal_values_are_public():
-    assert TaskState.__args__ == ("queued", "running", "completed", "failed")
+    assert TaskState.__args__ == (
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "dead_lettered",
+    )
 
 
 @pytest.mark.asyncio
@@ -304,7 +534,8 @@ async def test_tasks_plugin_registers_tasks_service():
     await manager.startup()
 
     service = manager.get("tasks")
-    assert isinstance(service, MemoryTaskQueue)
+    assert isinstance(service, TaskQueueBackendRegistry)
+    assert isinstance(service.provider(), MemoryTaskQueue)
 
     task = await service.enqueue("index_document", {"id": "doc-1"})
     assert task.name == "index_document"
@@ -319,7 +550,7 @@ async def test_tasks_plugin_memory_adapter_can_use_configured_service_name():
             "plugins": {
                 "tasks": {
                     "enabled": True,
-                    "config": {"adapter": "memory", "service": "jobs"},
+                    "config": {"default_provider": "memory", "service": "jobs"},
                 }
             }
         }
@@ -328,7 +559,9 @@ async def test_tasks_plugin_memory_adapter_can_use_configured_service_name():
 
     await manager.startup()
 
-    assert isinstance(manager.get("jobs"), MemoryTaskQueue)
+    service = manager.get("jobs")
+    assert isinstance(service, TaskQueueBackendRegistry)
+    assert isinstance(service.provider(), MemoryTaskQueue)
     assert manager.get("tasks") is None
 
     await manager.shutdown()
@@ -343,23 +576,28 @@ async def test_tasks_plugin_redis_adapter_accepts_injected_client_for_tests():
                 "tasks": {
                     "enabled": True,
                     "config": {
-                        "adapter": "redis",
-                        "redis": redis,
-                        "consumer_name": "worker-a",
-                        "pending_min_idle_ms": 1234,
+                        "default_provider": "redis",
+                        "providers": {
+                            "redis": {
+                                "consumer_name": "worker-a",
+                                "pending_min_idle_ms": 1234,
+                            }
+                        },
                     },
                 }
             }
         }
     )
-    manager = PluginManager(settings=settings, plugins=[TasksPlugin()])
+    manager = PluginManager(settings=settings, plugins=[TasksPlugin(redis=redis)])
 
     await manager.startup()
 
     service = manager.get("tasks")
-    assert isinstance(service, RedisStreamTaskQueue)
-    assert service._consumer_name == "worker-a"
-    assert service._pending_min_idle_ms == 1234
+    assert isinstance(service, TaskQueueBackendRegistry)
+    queue = service.provider()
+    assert isinstance(queue, RedisStreamTaskQueue)
+    assert queue._consumer_name == "worker-a"
+    assert queue._pending_min_idle_ms == 1234
     task = await service.enqueue("index_document", {"id": "doc-1"})
     assert queue_task_name(redis, task.id) == "index_document"
 
@@ -376,9 +614,13 @@ async def test_tasks_plugin_redis_adapter_uses_database_service_client():
                 "tasks": {
                     "enabled": True,
                     "config": {
-                        "adapter": "redis",
-                        "consumer_name": "worker-b",
-                        "pending_min_idle_ms": 5678,
+                        "default_provider": "redis",
+                        "providers": {
+                            "redis": {
+                                "consumer_name": "worker-b",
+                                "pending_min_idle_ms": 5678,
+                            }
+                        },
                     },
                 },
             }
@@ -392,11 +634,50 @@ async def test_tasks_plugin_redis_adapter_uses_database_service_client():
     await manager.startup()
 
     service = manager.get("tasks")
-    assert isinstance(service, RedisStreamTaskQueue)
-    assert service._consumer_name == "worker-b"
-    assert service._pending_min_idle_ms == 5678
+    assert isinstance(service, TaskQueueBackendRegistry)
+    queue = service.provider()
+    assert isinstance(queue, RedisStreamTaskQueue)
+    assert queue._consumer_name == "worker-b"
+    assert queue._pending_min_idle_ms == 5678
     task = await service.enqueue("index_document", {"id": "doc-1"})
     assert queue_task_name(redis, task.id) == "index_document"
+
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tasks_plugin_loads_external_provider_from_entry_point(monkeypatch):
+    def provider_factory(config):
+        return CustomTaskQueue(config)
+
+    monkeypatch.setattr(
+        "infra.plugins.provider_extensions.entry_points",
+        lambda group: [FakeTaskEntryPoint("custom", provider_factory)],
+    )
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "tasks": {
+                    "enabled": True,
+                    "config": {
+                        "default_provider": "custom",
+                        "providers": {"custom": {"queue_url": "memory://custom"}},
+                    },
+                }
+            }
+        }
+    )
+    manager = PluginManager(settings=settings, plugins=[TasksPlugin()])
+
+    await manager.startup()
+
+    service = manager.get("tasks")
+    assert isinstance(service, TaskQueueBackendRegistry)
+    provider = service.provider()
+    assert isinstance(provider, CustomTaskQueue)
+    assert provider.config == {"queue_url": "memory://custom"}
+    task = await service.enqueue("index_document", {"id": "doc-1"})
+    assert provider.get(task.id).name == "index_document"
 
     await manager.shutdown()
 
@@ -406,14 +687,64 @@ async def test_tasks_plugin_forced_redis_adapter_requires_redis_backing():
     settings = InfraSettings(
         infra={
             "plugins": {
-                "tasks": {"enabled": True, "config": {"adapter": "redis"}},
+                "tasks": {"enabled": True, "config": {"default_provider": "redis"}},
             }
         }
     )
     manager = PluginManager(settings=settings, plugins=[TasksPlugin()])
 
-    with pytest.raises(RuntimeError, match="Redis task adapter requires"):
+    with pytest.raises(RuntimeError, match="Redis task provider requires"):
         await manager.startup()
+
+
+@pytest.mark.asyncio
+async def test_tasks_plugin_reports_redis_health_details():
+    redis = FakeRedis()
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "tasks": {
+                    "enabled": True,
+                    "config": {"default_provider": "redis", "service": "jobs"},
+                }
+            }
+        }
+    )
+    manager = PluginManager(settings=settings, plugins=[TasksPlugin(redis=redis)])
+
+    await manager.startup()
+
+    status = manager.health.snapshot()["tasks"]
+    assert status.status is HealthState.HEALTHY
+    assert status.details == {"provider": "redis", "service": "jobs"}
+    assert ("ping", (), {}) in redis.calls
+
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tasks_plugin_reports_unhealthy_when_redis_health_check_fails():
+    redis = FakeRedis()
+    redis.ping_ok = False
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "tasks": {
+                    "enabled": True,
+                    "config": {"default_provider": "redis"},
+                }
+            }
+        }
+    )
+    manager = PluginManager(settings=settings, plugins=[TasksPlugin(redis=redis)])
+
+    with pytest.raises(PluginDependencyError, match="plugin is unhealthy: tasks"):
+        await manager.startup()
+
+    status = manager.health.snapshot()["tasks"]
+    assert status.status is HealthState.UNHEALTHY
+    assert status.message == "task queue health check failed"
+    assert status.details == {"provider": "redis", "service": "tasks"}
 
 
 def queue_task_name(redis: FakeRedis, task_id: str) -> str:

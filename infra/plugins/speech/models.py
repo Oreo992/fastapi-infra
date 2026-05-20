@@ -5,6 +5,7 @@ class TranscriptionRequest(BaseModel):
     audio: bytes
     format: str = "wav"
     language: str | None = None
+    prompt: str | None = None
     model: str = "mock-asr"
 
 
@@ -27,3 +28,4 @@ class SpeechSynthesisResult(BaseModel):
     content_type: str
     provider: str
     model: str
+    format: str | None = None

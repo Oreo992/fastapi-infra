@@ -1,6 +1,13 @@
 from collections.abc import AsyncIterator
 
-from infra.plugins.ai.models import ChatChunk, ChatRequest, ChatResponse, ToolCall
+from infra.plugins.ai.models import (
+    ChatChunk,
+    ChatRequest,
+    ChatResponse,
+    EmbeddingRequest,
+    EmbeddingResponse,
+    ToolCall,
+)
 
 
 class MockAIProvider:
@@ -31,6 +38,9 @@ class MockAIProvider:
     async def stream_chat(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
         for content in ("mock ", "response: ", self._last_user_content(request)):
             yield ChatChunk(provider=self.name, model=request.model, content=content)
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        raise NotImplementedError("mock provider does not support embeddings")
 
     def _last_user_content(self, request: ChatRequest) -> str:
         for message in reversed(request.messages):

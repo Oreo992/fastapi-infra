@@ -8,3 +8,12 @@ class PaymentCheckout(BaseModel):
     reference: str | None = None
     status: str
     url: str
+
+
+class PaymentRefund(BaseModel):
+    id: str
+    checkout_id: str
+    amount: int
+    currency: str
+    status: str
+    reference: str | None = None

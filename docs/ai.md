@@ -18,7 +18,9 @@ The public DTOs are:
 Mock is the default provider and needs no network or API key.
 
 ```python
-ai = infra.get("ai")
+from infra.plugins import AI_SERVICE
+
+ai = infra.require(AI_SERVICE)
 response = await ai.chat_text("hello")
 assert response.provider == "mock"
 ```
@@ -31,7 +33,17 @@ settings = InfraSettings(
         "plugins": {
             "ai": {
                 "enabled": True,
-                "config": {"default_provider": "mock"},
+                "config": {
+                    "default_provider": "openai",
+                    "health_probe": True,
+                    "providers": {
+                        "openai": {
+                            "api_key": "sk-...",
+                            "base_url": "https://api.openai.com/v1",
+                            "timeout": 10,
+                        }
+                    },
+                },
             }
         }
     }
@@ -46,6 +58,9 @@ Valid `default_provider` values:
 - `gemini`
 
 The SDK adapters are lazy. Creating the plugin does not import SDK packages or require keys. The SDK is imported only when that provider is used.
+Health checks also avoid vendor network calls by default. Set
+`health_probe=True` in production to call the configured provider's model-list
+API and verify credentials/upstream reachability.
 
 ## Optional SDKs
 

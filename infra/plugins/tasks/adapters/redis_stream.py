@@ -1,11 +1,15 @@
 import inspect
 import json
+import time
+from collections.abc import Callable
 from typing import Any
 
 from infra.plugins.tasks.models import TaskEnvelope
 
 
 class RedisStreamTaskQueue:
+    name = "redis"
+
     def __init__(
         self,
         redis: Any,
@@ -13,12 +17,14 @@ class RedisStreamTaskQueue:
         consumer_group: str = "infra",
         consumer_name: str = "tasks",
         pending_min_idle_ms: int = 60_000,
+        now: Callable[[], float] | None = None,
     ) -> None:
         self._redis = redis
         self._stream_name = stream_name
         self._consumer_group = consumer_group
         self._consumer_name = consumer_name
         self._pending_min_idle_ms = pending_min_idle_ms
+        self._now = now or time.time
         self._consumer_group_ready = False
         self._tasks: dict[str, TaskEnvelope] = {}
         self._message_ids: dict[str, str] = {}
@@ -27,14 +33,32 @@ class RedisStreamTaskQueue:
         self,
         name: str,
         payload: dict[str, Any] | None = None,
+        *,
+        idempotency_key: str | None = None,
+        delay_seconds: float = 0,
+        max_attempts: int = 1,
     ) -> TaskEnvelope:
-        task = TaskEnvelope(name=name, payload=payload)
-        await self._persist(task)
-        await self._call(
-            "xadd",
-            self._stream_name,
-            {"task_id": self._json_dumps(task.id)},
+        normalized_key = _normalize_idempotency_key(idempotency_key)
+        if normalized_key is not None:
+            existing_id = await self._load_idempotent_task_id(normalized_key)
+            if existing_id is not None:
+                return await self.get_async(existing_id)
+
+        task = TaskEnvelope(
+            name=name,
+            payload=payload,
+            idempotency_key=normalized_key,
+            max_attempts=max_attempts,
+            available_at=self._now() + max(0, delay_seconds),
         )
+        if normalized_key is not None:
+            reserved = await self._reserve_idempotency_key(normalized_key, task.id)
+            if not reserved:
+                existing_id = await self._load_idempotent_task_id(normalized_key)
+                if existing_id is not None:
+                    return await self.get_async(existing_id)
+        await self._persist(task)
+        await self._publish(task.id)
         return task.model_copy(deep=True)
 
     async def dequeue(self) -> TaskEnvelope | None:
@@ -130,11 +154,19 @@ class RedisStreamTaskQueue:
             for message_id, fields in stream_messages:
                 normalized = self._normalize_mapping(fields)
                 task_id = self._json_loads(normalized["task_id"])
+                self._message_ids[task_id] = self._decode(message_id)
                 task = await self._load(task_id)
                 if task.state not in ("queued", "running"):
+                    await self._ack(task_id)
+                    self._message_ids.pop(task_id, None)
+                    continue
+                if task.available_at > self._now():
+                    await self._ack(task_id)
+                    self._message_ids.pop(task_id, None)
+                    await self._publish(task_id)
                     continue
                 running = task.model_copy(update={"state": "running"})
-                self._message_ids[task_id] = self._decode(message_id)
+                running = running.model_copy(update={"attempts": running.attempts + 1})
                 await self._persist(running)
                 return running.model_copy(deep=True)
         return None
@@ -151,13 +183,49 @@ class RedisStreamTaskQueue:
         await self._persist(failed)
         await self._ack(task_id)
 
+    async def retry(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        delay_seconds: float = 0,
+    ) -> None:
+        task = await self._load(task_id)
+        retried = task.model_copy(
+            update={
+                "state": "queued",
+                "error": reason,
+                "available_at": self._now() + max(0, delay_seconds),
+            }
+        )
+        await self._persist(retried)
+        await self._ack(task_id)
+        self._message_ids.pop(task_id, None)
+        await self._publish(task_id)
+
+    async def dead_letter(self, task_id: str, reason: str) -> None:
+        task = await self._load(task_id)
+        dead_lettered = task.model_copy(update={"state": "dead_lettered", "error": reason})
+        await self._persist(dead_lettered)
+        await self._ack(task_id)
+
+    async def health_check(self) -> bool:
+        if hasattr(self._redis, "ping"):
+            return bool(await self._call("ping"))
+        await self._ensure_consumer_group()
+        return True
+
     async def _persist(self, task: TaskEnvelope) -> None:
         mapping = {
             "id": self._json_dumps(task.id),
             "name": self._json_dumps(task.name),
             "payload": self._json_dumps(task.payload),
+            "idempotency_key": self._json_dumps(task.idempotency_key),
             "state": self._json_dumps(task.state),
             "error": self._json_dumps(task.error),
+            "attempts": self._json_dumps(task.attempts),
+            "max_attempts": self._json_dumps(task.max_attempts),
+            "available_at": self._json_dumps(task.available_at),
         }
         message_id = self._message_ids.get(task.id)
         if message_id is not None:
@@ -172,8 +240,12 @@ class RedisStreamTaskQueue:
             id=self._json_loads(data["id"]),
             name=self._json_loads(data["name"]),
             payload=self._json_loads(data["payload"]),
+            idempotency_key=self._json_loads(data.get("idempotency_key", "null")),
             state=self._json_loads(data["state"]),
             error=self._json_loads(data["error"]),
+            attempts=self._json_loads(data["attempts"]),
+            max_attempts=self._json_loads(data["max_attempts"]),
+            available_at=self._json_loads(data["available_at"]),
         )
         message_id = data.get("_stream_message_id")
         if message_id is not None:
@@ -192,6 +264,32 @@ class RedisStreamTaskQueue:
             message_id,
         )
 
+    async def _publish(self, task_id: str) -> None:
+        await self._call(
+            "xadd",
+            self._stream_name,
+            {"task_id": self._json_dumps(task_id)},
+        )
+
+    async def _load_idempotent_task_id(self, idempotency_key: str) -> str | None:
+        if not hasattr(self._redis, "get"):
+            return None
+        raw = await self._call("get", self._idempotency_key(idempotency_key))
+        if raw is None:
+            return None
+        return self._decode(raw)
+
+    async def _reserve_idempotency_key(self, idempotency_key: str, task_id: str) -> bool:
+        if not hasattr(self._redis, "set"):
+            return True
+        result = await self._call(
+            "set",
+            self._idempotency_key(idempotency_key),
+            task_id,
+            nx=True,
+        )
+        return bool(result)
+
     async def _call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         result = getattr(self._redis, method_name)(*args, **kwargs)
         if inspect.isawaitable(result):
@@ -200,6 +298,9 @@ class RedisStreamTaskQueue:
 
     def _task_key(self, task_id: str) -> str:
         return f"{self._stream_name}:task:{task_id}"
+
+    def _idempotency_key(self, idempotency_key: str) -> str:
+        return f"{self._stream_name}:idempotency:{idempotency_key}"
 
     def _normalize_mapping(self, mapping: dict[Any, Any]) -> dict[str, str]:
         return {self._decode(key): self._decode(value) for key, value in mapping.items()}
@@ -241,3 +342,12 @@ class RedisStreamTaskQueue:
 
     def _json_loads(self, value: str) -> Any:
         return json.loads(value)
+
+
+def _normalize_idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("idempotency_key must not be empty")
+    return normalized

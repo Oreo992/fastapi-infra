@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 logs/*.log
+build/
+dist/
+*.egg-info/

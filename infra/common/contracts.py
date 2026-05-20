@@ -1,22 +1,20 @@
-"""
-统一API契约层
+"""Shared API contracts for application routes and infrastructure errors."""
 
-定义所有API的请求响应模型、错误码和分页规范
-"""
-
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Self, TypeVar
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
-# 泛型类型
 T = TypeVar("T")
 
 
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 class ErrorCode(str, Enum):
-    """统一错误码"""
+    """Stable error codes used by middleware and application routes."""
 
     INTERNAL_ERROR = "INTERNAL_ERROR"
     VALIDATION_ERROR = "VALIDATION_ERROR"
@@ -31,7 +29,9 @@ class ErrorCode(str, Enum):
 
 
 class ErrorDetail(BaseModel):
-    """错误详情"""
+    """Structured error payload."""
+
+    model_config = ConfigDict(extra="forbid")
 
     code: ErrorCode = Field(..., description="错误代码")
     message: str = Field(..., description="错误消息")
@@ -40,25 +40,52 @@ class ErrorDetail(BaseModel):
 
 
 class ApiResponse(BaseModel, Generic[T]):
-    """统一API响应格式"""
+    """Single response envelope used by infrastructure helpers."""
+
+    model_config = ConfigDict(extra="forbid")
 
     success: bool = Field(..., description="是否成功")
     data: T | None = Field(default=None, description="响应数据")
     error: ErrorDetail | None = Field(default=None, description="错误信息")
-    timestamp: str = Field(..., description="时间戳")
+    timestamp: str = Field(default_factory=_now_iso, description="时间戳")
     trace_id: str | None = Field(default=None, description="追踪ID")
+
+    @classmethod
+    def ok(cls, data: T | None = None, *, trace_id: str | None = None) -> Self:
+        return cls(success=True, data=data, trace_id=trace_id)
+
+    @classmethod
+    def fail(
+        cls,
+        code: ErrorCode,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ) -> Self:
+        return cls(
+            success=False,
+            error=ErrorDetail(
+                code=code,
+                message=message,
+                details=details,
+                trace_id=trace_id,
+            ),
+            trace_id=trace_id,
+        )
 
     @field_validator("timestamp", mode="before")
     @classmethod
-    def convert_timestamp(cls, v):
-        """自动将 datetime 转换为 ISO 格式字符串"""
-        if isinstance(v, datetime):
-            return v.isoformat()
-        return v
+    def convert_timestamp(cls, value: object) -> object:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return value
 
 
 class PaginationParams(BaseModel):
-    """分页参数"""
+    """Validated page-number pagination input."""
+
+    model_config = ConfigDict(extra="forbid")
 
     page: int = Field(default=1, ge=1, description="页码")
     size: int = Field(default=20, ge=1, le=100, description="每页大小")
@@ -69,60 +96,17 @@ class PaginationParams(BaseModel):
 
 
 class PaginatedResponse(BaseModel, Generic[T]):
-    """分页响应"""
+    """Page-number pagination output."""
+
+    model_config = ConfigDict(extra="forbid")
 
     items: list[T] = Field(..., description="数据列表")
-    total: int = Field(..., description="总数")
-    page: int = Field(..., description="当前页码")
-    size: int = Field(..., description="每页大小")
-    pages: int = Field(..., description="总页数")
+    total: int = Field(..., ge=0, description="总数")
+    page: int = Field(..., ge=1, description="当前页码")
+    size: int = Field(..., ge=1, description="每页大小")
+    pages: int = Field(..., ge=0, description="总页数")
 
     @classmethod
-    def create(cls, items: list[T], total: int, page: int, size: int):
+    def create(cls, items: list[T], total: int, page: int, size: int) -> Self:
         pages = (total + size - 1) // size if total > 0 else 0
         return cls(items=items, total=total, page=page, size=size, pages=pages)
-
-
-class HealthStatus(BaseModel):
-    """健康检查状态"""
-
-    service: str = Field(..., description="服务名称")
-    status: str = Field(..., description="状态: healthy, unhealthy, degraded")
-    timestamp: str = Field(..., description="检查时间")
-    details: dict[str, Any] | None = Field(default=None, description="详细信息")
-
-    @field_validator("timestamp", mode="before")
-    @classmethod
-    def convert_timestamp(cls, v):
-        """自动将 datetime 转换为 ISO 格式字符串"""
-        if isinstance(v, datetime):
-            return v.isoformat()
-        return v
-
-
-class HealthResponse(BaseModel):
-    """健康检查响应"""
-
-    status: str = Field(..., description="整体状态")
-    version: str = Field(..., description="版本")
-    environment: str = Field(..., description="环境")
-    checks: list[HealthStatus] = Field(..., description="检查项目")
-    uptime: float | None = Field(default=None, description="运行时间(秒)")
-
-
-class StandardResponse(BaseModel, Generic[T]):
-    """标准响应格式（兼容前端）"""
-
-    code: int = Field(default=200, description="状态码")
-    msg: str = Field(default="success", description="消息")
-    data: T | None = Field(default=None, description="响应数据")
-
-    @classmethod
-    def success(cls, data: T | None = None, msg: str = "success"):
-        """成功响应"""
-        return cls(code=200, msg=msg, data=data)
-
-    @classmethod
-    def error(cls, msg: str, code: int = 500):
-        """错误响应"""
-        return cls(code=code, msg=msg, data=None)

@@ -10,8 +10,8 @@
 import asyncio
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any, Protocol
 
-from infra.database.manager import DatabaseManager
 from infra.logging import get_logger
 
 logger = get_logger(__name__)
@@ -23,10 +23,16 @@ class LockAcquisitionError(Exception):
     pass
 
 
+class LockDatabase(Protocol):
+    async def initialize(self) -> None: ...
+
+    async def get_redis_client(self) -> Any: ...
+
+
 class DistributedLockManager:
     """基于Redis的分布式锁管理器"""
 
-    def __init__(self, db: DatabaseManager, prefix: str = "lock"):
+    def __init__(self, db: LockDatabase, prefix: str = "lock"):
         """初始化锁管理器
 
         Args:
@@ -34,7 +40,7 @@ class DistributedLockManager:
         """
         self.prefix = prefix
         self._db = db
-        self._lock_tokens = {}  # {key: token} 记录已获取的锁
+        self._lock_tokens: dict[str, str] = {}  # {key: token} 记录已获取的锁
 
     def _build_key(self, key: str) -> str:
         """构建完整的锁key
@@ -46,6 +52,18 @@ class DistributedLockManager:
             完整的Redis key
         """
         return f"{self.prefix}:{key}"
+
+    def _validate_key(self, key: str) -> None:
+        if not key.strip():
+            raise ValueError("lock key must not be empty")
+
+    def _validate_positive_seconds(self, name: str, value: int) -> None:
+        if isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+
+    def _validate_non_negative_seconds(self, name: str, value: int) -> None:
+        if isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
 
     async def acquire(
         self,
@@ -68,6 +86,10 @@ class DistributedLockManager:
         Raises:
             LockAcquisitionError: 获取锁失败
         """
+        self._validate_key(key)
+        self._validate_positive_seconds("timeout", timeout)
+        self._validate_non_negative_seconds("block_timeout", block_timeout)
+
         redis = await self._get_redis()
         lock_key = self._build_key(key)
         token = str(uuid.uuid4())
@@ -94,9 +116,7 @@ class DistributedLockManager:
             # 检查阻塞超时
             elapsed = asyncio.get_event_loop().time() - start_time
             if elapsed >= block_timeout:
-                raise LockAcquisitionError(
-                    f"获取锁超时: {key}（等待{block_timeout}秒后仍被占用）"
-                )
+                raise LockAcquisitionError(f"获取锁超时: {key}（等待{block_timeout}秒后仍被占用）")
 
             # 等待后重试
             await asyncio.sleep(0.1)
@@ -111,6 +131,10 @@ class DistributedLockManager:
         Returns:
             是否成功释放
         """
+        self._validate_key(key)
+        if not token:
+            raise ValueError("lock token must not be empty")
+
         redis = await self._get_redis()
         lock_key = self._build_key(key)
 
@@ -144,6 +168,11 @@ class DistributedLockManager:
         Returns:
             是否成功延期
         """
+        self._validate_key(key)
+        if not token:
+            raise ValueError("lock token must not be empty")
+        self._validate_positive_seconds("ttl", ttl)
+
         redis = await self._get_redis()
         lock_key = self._build_key(key)
 
@@ -191,4 +220,4 @@ class DistributedLockManager:
 
     async def _get_redis(self):
         await self._db.initialize()
-        return await self._db._get_or_create_redis_client()
+        return await self._db.get_redis_client()

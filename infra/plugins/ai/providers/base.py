@@ -1,7 +1,13 @@
 from collections.abc import AsyncIterator
 from typing import Protocol
 
-from infra.plugins.ai.models import ChatChunk, ChatRequest, ChatResponse
+from infra.plugins.ai.models import (
+    ChatChunk,
+    ChatRequest,
+    ChatResponse,
+    EmbeddingRequest,
+    EmbeddingResponse,
+)
 
 
 class AIProvider(Protocol):
@@ -13,4 +19,7 @@ class AIProvider(Protocol):
         raise NotImplementedError
 
     def stream_chat(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
+        raise NotImplementedError
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         raise NotImplementedError
