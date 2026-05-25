@@ -11,7 +11,7 @@ import warnings
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 from infra.config import validate_infra_settings
 from infra.config.models import InfraSettings
@@ -44,6 +44,22 @@ ENV_EXAMPLE_VALUES = {
     "STRIPE_API_KEY": "sk-stripe",
     "STRIPE_WEBHOOK_SECRET": "whsec_test",
 }
+DEFAULT_METADATA_DEPENDENCIES = (
+    "fastapi>=0.117.1,<0.118.0",
+    "uvicorn[standard]>=0.37.0,<0.38.0",
+    "starlette>=0.48.0,<0.49.0",
+    "pydantic>=2.11.0,<3.0.0",
+    "pydantic-settings>=2.10.0,<3.0.0",
+    "loguru>=0.7.0,<0.8.0",
+)
+DEFAULT_REQUIRES_TXT = (
+    "fastapi<0.118.0,>=0.117.1\n"
+    "uvicorn[standard]<0.38.0,>=0.37.0\n"
+    "starlette<0.49.0,>=0.48.0\n"
+    "pydantic<3.0.0,>=2.11.0\n"
+    "pydantic-settings<3.0.0,>=2.10.0\n"
+    "loguru<0.8.0,>=0.7.0\n"
+)
 
 
 def test_httpx_dependency_range_is_consistent_for_testclient_users() -> None:
@@ -52,6 +68,13 @@ def test_httpx_dependency_range_is_consistent_for_testclient_users() -> None:
 
     assert "httpx>=0.27.0,<0.29.0" in optional_dependencies["http"]
     assert "httpx>=0.27.0,<0.29.0" in optional_dependencies["dev"]
+
+
+def test_release_checker_dependencies_are_declared_for_dev_workflows() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    optional_dependencies = pyproject["project"]["optional-dependencies"]
+
+    assert "packaging>=24.0" in optional_dependencies["dev"]
 
 
 def test_plugin_manifest_recommended_extras_are_defined_package_extras() -> None:
@@ -115,12 +138,128 @@ def test_distribution_check_accepts_clean_artifacts(tmp_path) -> None:
     assert module.main([str(wheel), str(source)]) == 0
 
 
+def test_distribution_check_rejects_unexpected_pyproject_build_backend(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[build-system]\n"
+            'requires = ["setuptools>=77.0.0", "wheel"]\n'
+            'build-backend = "hatchling.build"\n\n'
+            + _pyproject_with_core_metadata(
+                'name = "fastapi-infra"',
+                'version = "0.2.0"',
+                'requires-python = ">=3.11"',
+            )
+        ),
+        "pyproject unexpected build-backend 'hatchling.build'",
+    )
+
+
+def test_distribution_check_rejects_unexpected_pyproject_build_requires(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[build-system]\n"
+            'requires = ["setuptools>=77.0.0", "wheel", "hatchling"]\n'
+            'build-backend = "setuptools.build_meta"\n\n'
+            + _pyproject_with_core_metadata(
+                'name = "fastapi-infra"',
+                'version = "0.2.0"',
+                'requires-python = ">=3.11"',
+            )
+        ),
+        "pyproject unexpected build-system.requires ['setuptools>=77.0.0', 'wheel', 'hatchling']",
+    )
+
+
+def test_distribution_check_rejects_unsupported_pyproject_build_system_field(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[build-system]\n"
+            'requires = ["setuptools>=77.0.0", "wheel"]\n'
+            'build-backend = "setuptools.build_meta"\n'
+            'backend-path = ["."]\n\n'
+            + _pyproject_with_core_metadata(
+                'name = "fastapi-infra"',
+                'version = "0.2.0"',
+                'requires-python = ">=3.11"',
+            )
+        ),
+        "pyproject unsupported build-system field backend-path",
+    )
+
+
+def _assert_distribution_check_rejects_pyproject(
+    tmp_path: Path,
+    capsys: Any,
+    pyproject: str,
+    expected_error: str,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=pyproject,
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert expected_error in captured.err
+
+
+def _pyproject_with_core_metadata(
+    *project_lines: str,
+    scripts: str | None = 'fastapi-infra = "infra.cli:main"',
+) -> str:
+    content = (
+        "[project]\n" + "\n".join(project_lines) + "\n"
+        "dependencies = [\n"
+        + "".join(f'    "{dependency}",\n' for dependency in DEFAULT_METADATA_DEPENDENCIES)
+        + "]\n"
+    )
+    if scripts is not None:
+        content += "\n[project.scripts]\n" + scripts + "\n"
+    return content
+
+
 def test_distribution_check_accepts_sdist_root_directory_entry(tmp_path) -> None:
     module = _load_script("scripts/check_distribution.py")
     wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
     source = _write_clean_sdist(
         tmp_path / "fastapi_infra-0.2.0.tar.gz",
         include_root_dir_entry=True,
+    )
+
+    assert module.main([str(wheel), str(source)]) == 0
+
+
+def test_distribution_check_accepts_setuptools_sdist_metadata_files(tmp_path) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=(
+            "fastapi_infra.egg-info/PKG-INFO",
+            "fastapi_infra.egg-info/SOURCES.txt",
+            "fastapi_infra.egg-info/dependency_links.txt",
+            "fastapi_infra.egg-info/entry_points.txt",
+            "fastapi_infra.egg-info/requires.txt",
+            "fastapi_infra.egg-info/top_level.txt",
+            "setup.cfg",
+        ),
     )
 
     assert module.main([str(wheel), str(source)]) == 0
@@ -135,6 +274,46 @@ def test_distribution_check_accepts_wheel_directory_entries(tmp_path) -> None:
     source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
 
     assert module.main([str(wheel), str(source)]) == 0
+
+
+def test_distribution_check_rejects_invalid_utf8_wheel_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=b"\xff",
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "invalid UTF-8 text in fastapi_infra-0.2.0.dist-info/METADATA" in captured.err
+
+
+def test_distribution_check_rejects_invalid_utf8_sdist_pkg_info(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=b"\xff",
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "invalid UTF-8 text in fastapi_infra-0.2.0/PKG-INFO" in captured.err
+
+
+def test_distribution_check_rejects_invalid_utf8_sdist_sources_txt(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/SOURCES.txt",),
+        extra_file_contents={"fastapi_infra.egg-info/SOURCES.txt": b"\xff"},
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "invalid UTF-8 text in fastapi_infra.egg-info/SOURCES.txt" in captured.err
 
 
 def test_distribution_check_rejects_duplicate_wheel_archive_member(tmp_path, capsys) -> None:
@@ -194,6 +373,410 @@ def test_distribution_check_rejects_empty_path_segment_archive_member(tmp_path, 
     assert module.main([str(wheel), str(source)]) == 1
     captured = capsys.readouterr()
     assert "unsafe archive entry infra//evil.py" in captured.err
+
+
+def test_distribution_check_rejects_wheel_generated_cache_file(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        extra_files=("infra/__pycache__/cli.cpython-311.pyc",),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "generated cache file infra/__pycache__/cli.cpython-311.pyc" in captured.err
+
+
+def test_distribution_check_rejects_sdist_generated_cache_file(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("infra/__pycache__/cli.cpython-311.pyc",),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "generated cache file infra/__pycache__/cli.cpython-311.pyc" in captured.err
+
+
+def test_distribution_check_rejects_wheel_generated_metadata_file(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        extra_files=(".DS_Store",),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "generated metadata file .DS_Store" in captured.err
+
+
+def test_distribution_check_rejects_sdist_generated_metadata_file(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("._README.md",),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "generated metadata file ._README.md" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_wheel_top_level_file(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        extra_files=("evil.py",),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel contains unexpected top-level path evil.py" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_sdist_top_level_path(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("other_package/__init__.py",),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist contains unexpected top-level path other_package/__init__.py" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_sdist_egg_info_file(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/evil.py",),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist contains unexpected egg-info file fastapi_infra.egg-info/evil.py" in (
+        captured.err
+    )
+
+
+def test_distribution_check_rejects_sdist_egg_info_metadata_directory(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/PKG-INFO",),
+        directory_entries=("fastapi_infra.egg-info/PKG-INFO",),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert (
+        "sdist metadata file is not a regular file fastapi_infra.egg-info/PKG-INFO" in captured.err
+    )
+
+
+def test_distribution_check_rejects_sdist_top_level_metadata_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/top_level.txt",),
+        extra_file_contents={"fastapi_infra.egg-info/top_level.txt": "infra\nother\n"},
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist top_level.txt unexpected top-level package other" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_sdist_top_level_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/top_level.txt",),
+        extra_file_contents={"fastapi_infra.egg-info/top_level.txt": "infra\ninfra\n"},
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist top_level.txt duplicate top-level package infra" in captured.err
+
+
+def test_distribution_check_rejects_sdist_entry_points_metadata_drift(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/entry_points.txt",),
+        extra_file_contents={"fastapi_infra.egg-info/entry_points.txt": ""},
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist entry_points.txt missing console script fastapi-infra = infra.cli:main" in (
+        captured.err
+    )
+
+
+def test_distribution_check_rejects_unexpected_sdist_console_entry_point(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/entry_points.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/entry_points.txt": (
+                "[console_scripts]\n"
+                "fastapi-infra = infra.cli:main\n"
+                "fastapi-infra-dev = infra.dev:main\n"
+            )
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert (
+        "sdist entry_points.txt unexpected console script " "fastapi-infra-dev = infra.dev:main"
+    ) in captured.err
+
+
+def test_distribution_check_rejects_case_mismatched_sdist_console_entry_point(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/entry_points.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/entry_points.txt": (
+                "[console_scripts]\n" "FastAPI-Infra = infra.cli:main\n"
+            )
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist entry_points.txt missing console script fastapi-infra = infra.cli:main" in (
+        captured.err
+    )
+
+
+def test_distribution_check_rejects_unexpected_sdist_entry_point_section(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/entry_points.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/entry_points.txt": (
+                "[console_scripts]\n"
+                "fastapi-infra = infra.cli:main\n"
+                "\n"
+                "[gui_scripts]\n"
+                "fastapi-infra-gui = infra.gui:main\n"
+            )
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist entry_points.txt unexpected entry point section gui_scripts" in captured.err
+
+
+def test_distribution_check_rejects_sdist_egg_info_pkg_info_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/PKG-INFO",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/PKG-INFO": "Name: fastapi-infra\nVersion: 9.9.9\n"
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist egg-info PKG-INFO does not match root PKG-INFO" in captured.err
+
+
+def test_distribution_check_rejects_sdist_sources_referencing_missing_file(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/SOURCES.txt",),
+        extra_file_contents={"fastapi_infra.egg-info/SOURCES.txt": "infra/missing.py\n"},
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist SOURCES.txt references missing archive entry infra/missing.py" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_sdist_sources_entry(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/SOURCES.txt",),
+        extra_file_contents={"fastapi_infra.egg-info/SOURCES.txt": "infra/cli.py\ninfra/cli.py\n"},
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist SOURCES.txt duplicate entry infra/cli.py" in captured.err
+
+
+def test_distribution_check_rejects_sdist_sources_missing_archive_file(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/SOURCES.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/SOURCES.txt": (
+                "infra/__init__.py\n"
+                "infra/scaffold.py\n"
+                "infra/provider_tests/test_live_providers.py\n"
+                "PKG-INFO\n"
+                "LICENSE\n"
+                "MANIFEST.in\n"
+                "README.md\n"
+                "pyproject.toml\n"
+                "fastapi_infra.egg-info/SOURCES.txt\n"
+            )
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist SOURCES.txt missing archive entry infra/cli.py" in captured.err
+
+
+def test_distribution_check_accepts_sdist_sources_without_generated_pkg_info(tmp_path) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/SOURCES.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/SOURCES.txt": (
+                "infra/__init__.py\n"
+                "infra/cli.py\n"
+                "infra/scaffold.py\n"
+                "infra/provider_tests/test_live_providers.py\n"
+                "LICENSE\n"
+                "MANIFEST.in\n"
+                "README.md\n"
+                "pyproject.toml\n"
+                "fastapi_infra.egg-info/SOURCES.txt\n"
+            )
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 0
+
+
+def test_distribution_check_rejects_sdist_requires_metadata_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/requires.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/requires.txt": (
+                "fastapi<0.118.0,>=0.117.1\n"
+                "uvicorn[standard]<0.38.0,>=0.37.0\n"
+                "starlette<0.49.0,>=0.48.0\n"
+                "pydantic<3.0.0,>=2.11.0\n"
+                "pydantic-settings<3.0.0,>=2.10.0\n"
+            )
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist requires.txt missing required dependency loguru" in captured.err
+
+
+def test_distribution_check_rejects_invalid_sdist_requires_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/requires.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/requires.txt": (
+                _requires_txt_content() + "not a valid requirement !!!\n"
+            )
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "invalid sdist requires.txt dependency not a valid requirement !!!" in captured.err
+
+
+def test_distribution_check_rejects_invalid_sdist_requires_section(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/requires.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/requires.txt": _requires_txt_content() + "[]\npytest\n"
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "invalid sdist requires.txt section []" in captured.err
+
+
+def test_distribution_check_rejects_sdist_dependency_links_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        extra_files=("fastapi_infra.egg-info/dependency_links.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/dependency_links.txt": "https://packages.example.test\n"
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist dependency_links.txt must be empty" in captured.err
 
 
 def test_distribution_check_rejects_top_level_test_artifacts(tmp_path) -> None:
@@ -262,6 +845,4365 @@ def test_distribution_check_rejects_wheel_metadata_mismatch(tmp_path, capsys) ->
     assert (
         "wheel metadata mismatch: filename fastapi-infra 0.2.0, " "METADATA fastapi-infra 0.2.1"
     ) in captured.err
+
+
+def test_distribution_check_rejects_missing_wheel_required_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA missing required dependency loguru" in captured.err
+
+
+def test_distribution_check_rejects_wheel_dependency_constraint_mismatch(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA dependency mismatch for fastapi" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_wheel_required_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "requests>=2.0.0",
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA unexpected required dependency requests" in captured.err
+
+
+def test_distribution_check_rejects_invalid_wheel_requires_dist(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "not a valid requirement !!!",
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert (
+        "wheel METADATA invalid Requires-Dist dependency not a valid requirement !!!"
+        in captured.err
+    )
+
+
+def test_distribution_check_rejects_direct_url_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    direct_url_dependency = "fastapi @ https://example.test/fastapi-0.117.1-py3-none-any.whl"
+    dependencies = (
+        direct_url_dependency,
+        "uvicorn[standard]>=0.37.0,<0.38.0",
+        "starlette>=0.48.0,<0.49.0",
+        "pydantic>=2.11.0,<3.0.0",
+        "pydantic-settings>=2.10.0,<3.0.0",
+        "loguru>=0.7.0,<0.8.0",
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=dependencies,
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=dependencies,
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            f'    "{direct_url_dependency}",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        extra_files=("fastapi_infra.egg-info/requires.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/requires.txt": "\n".join(dependencies) + "\n",
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject direct URL dependency fastapi" in captured.err
+    assert "wheel METADATA direct URL dependency fastapi" in captured.err
+    assert "sdist PKG-INFO direct URL dependency fastapi" in captured.err
+    assert "sdist requires.txt direct URL dependency fastapi" in captured.err
+
+
+def test_distribution_check_rejects_direct_url_optional_dependency(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    direct_url_dependency = "pytest @ https://example.test/pytest-8.0.0-py3-none-any.whl"
+    optional_dependency = f'{direct_url_dependency} ; extra == "dev"'
+    dependencies = (
+        "fastapi>=0.117.1,<0.118.0",
+        "uvicorn[standard]>=0.37.0,<0.38.0",
+        "starlette>=0.48.0,<0.49.0",
+        "pydantic>=2.11.0,<3.0.0",
+        "pydantic-settings>=2.10.0,<3.0.0",
+        "loguru>=0.7.0,<0.8.0",
+        optional_dependency,
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=dependencies,
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=dependencies,
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            "dev = [\n"
+            f'    "{direct_url_dependency}",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        extra_files=("fastapi_infra.egg-info/requires.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/requires.txt": (
+                "fastapi>=0.117.1,<0.118.0\n"
+                "uvicorn[standard]>=0.37.0,<0.38.0\n"
+                "starlette>=0.48.0,<0.49.0\n"
+                "pydantic>=2.11.0,<3.0.0\n"
+                "pydantic-settings>=2.10.0,<3.0.0\n"
+                "loguru>=0.7.0,<0.8.0\n"
+                "\n"
+                "[dev]\n"
+                f"{direct_url_dependency}\n"
+            ),
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject direct URL optional dependency dev:pytest" in captured.err
+    assert "wheel METADATA direct URL optional dependency dev:pytest" in captured.err
+    assert "sdist PKG-INFO direct URL optional dependency dev:pytest" in captured.err
+    assert "sdist requires.txt direct URL optional dependency dev:pytest" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_required_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate required dependency fastapi" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_pyproject_required_dependency(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject duplicate required dependency fastapi" in captured.err
+
+
+def test_distribution_check_rejects_invalid_pyproject_required_dependency(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            '    "not a valid requirement !!!",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid required dependency not a valid requirement !!!" in captured.err
+
+
+def test_distribution_check_rejects_pyproject_required_dependency_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    " fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid required dependency  fastapi>=0.117.1,<0.118.0" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_required_dependency(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "    123,\n"
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid required dependency 123" in captured.err
+
+
+def test_distribution_check_rejects_missing_pyproject_requires_python(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist pyproject.toml missing project.requires-python" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_requires_python(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            "requires-python = 123",
+        ),
+        "pyproject invalid requires-python 123",
+    )
+
+
+def test_distribution_check_rejects_invalid_pyproject_requires_python(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'requires-python = "not a specifier"',
+        ),
+        "pyproject invalid requires-python 'not a specifier'",
+    )
+
+
+def test_distribution_check_rejects_pyproject_requires_python_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'requires-python = " >=3.11"',
+        ),
+        "pyproject invalid requires-python ' >=3.11'",
+    )
+
+
+def test_distribution_check_rejects_missing_pyproject_dependencies(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist pyproject.toml missing project.dependencies list" in captured.err
+
+
+def test_distribution_check_rejects_non_list_pyproject_dependencies(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            'dependencies = "fastapi>=0.117.1,<0.118.0"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        "pyproject invalid dependencies list 'fastapi>=0.117.1,<0.118.0'",
+    )
+
+
+def test_distribution_check_rejects_non_string_pyproject_name(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            "name = 123",
+            'version = "0.2.0"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid project.name 123",
+    )
+
+
+def test_distribution_check_rejects_non_string_pyproject_version(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            "version = 123",
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid project.version 123",
+    )
+
+
+def test_distribution_check_rejects_invalid_pyproject_name(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi infra"',
+            'version = "0.2.0"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid project.name 'fastapi infra'",
+    )
+
+
+def test_distribution_check_rejects_invalid_pyproject_version(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "not a version"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid project.version 'not a version'",
+    )
+
+
+def test_distribution_check_rejects_pyproject_version_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = " 0.2.0"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid project.version ' 0.2.0'",
+    )
+
+
+def test_distribution_check_rejects_missing_pyproject_core_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    dependencies_without_fastapi = (
+        "uvicorn[standard]>=0.37.0,<0.38.0",
+        "starlette>=0.48.0,<0.49.0",
+        "pydantic>=2.11.0,<3.0.0",
+        "pydantic-settings>=2.10.0,<3.0.0",
+        "loguru>=0.7.0,<0.8.0",
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=dependencies_without_fastapi,
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=dependencies_without_fastapi,
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject missing required core dependency fastapi" in captured.err
+
+
+def test_distribution_check_rejects_missing_wheel_provides_extra(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = ["pytest>=8.0.0"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA missing provided extra dev" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_wheel_provides_extra(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("docs",),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA unexpected provided extra docs" in captured.err
+
+
+def test_distribution_check_rejects_invalid_wheel_provides_extra(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("-dev",),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA invalid provided extra -dev" in captured.err
+
+
+def test_distribution_check_rejects_invalid_wheel_requires_dist_extra_marker(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "pytest>=8.0.0; extra == '-dev'",
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA invalid Requires-Dist extra marker -dev" in captured.err
+
+
+def test_distribution_check_rejects_wheel_requires_dist_undeclared_extra(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "pytest>=8.0.0; extra == 'dev'",
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA Requires-Dist references undeclared extra dev" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_provides_extra(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "pytest>=8.0.0; extra == 'dev'",
+        ),
+        metadata_extras=("dev", "dev"),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+                "pytest>=8.0.0; extra == 'dev'",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = ["pytest>=8.0.0"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate provided extra dev" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_normalized_pyproject_extra(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("dev-test",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=("dev-test",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            "dev_test = []\n"
+            "dev-test = []\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject duplicate optional dependency extra dev-test" in captured.err
+
+
+def test_distribution_check_rejects_invalid_pyproject_extra_name(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("-dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=("-dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            '"-dev" = []\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid optional dependency extra -dev" in captured.err
+
+
+def test_distribution_check_rejects_missing_wheel_extra_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+                "pytest>=8.0.0; extra == 'dev'",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = ["pytest>=8.0.0"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA missing optional dependency dev:pytest" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_wheel_extra_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "pytest>=8.0.0; extra == 'dev'",
+            "requests>=2.0.0; extra == 'dev'",
+        ),
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+                "pytest>=8.0.0; extra == 'dev'",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = ["pytest>=8.0.0"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA unexpected optional dependency dev:requests" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_extra_dependency(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "pytest>=8.0.0; extra == 'dev'",
+            "pytest>=8.0.0; extra == 'dev'",
+        ),
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+                "pytest>=8.0.0; extra == 'dev'",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = ["pytest>=8.0.0"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate optional dependency dev:pytest" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_pyproject_extra_dependency(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "pytest>=8.0.0; extra == 'dev'",
+        ),
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+                "pytest>=8.0.0; extra == 'dev'",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = ["pytest>=8.0.0", "pytest>=8.0.0"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject duplicate optional dependency dev:pytest" in captured.err
+
+
+def test_distribution_check_rejects_invalid_pyproject_extra_dependency(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = ["not a valid requirement !!!"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid optional dependency dev:not a valid requirement !!!" in captured.err
+
+
+def test_distribution_check_rejects_pyproject_extra_dependency_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    dependencies = (
+        "fastapi>=0.117.1,<0.118.0",
+        "uvicorn[standard]>=0.37.0,<0.38.0",
+        "starlette>=0.48.0,<0.49.0",
+        "pydantic>=2.11.0,<3.0.0",
+        "pydantic-settings>=2.10.0,<3.0.0",
+        "loguru>=0.7.0,<0.8.0",
+        'pytest>=8.0.0 ; extra == "dev"',
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=dependencies,
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=dependencies,
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = [" pytest>=8.0.0"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        extra_files=("fastapi_infra.egg-info/requires.txt",),
+        extra_file_contents={
+            "fastapi_infra.egg-info/requires.txt": (
+                "fastapi>=0.117.1,<0.118.0\n"
+                "uvicorn[standard]>=0.37.0,<0.38.0\n"
+                "starlette>=0.48.0,<0.49.0\n"
+                "pydantic>=2.11.0,<3.0.0\n"
+                "pydantic-settings>=2.10.0,<3.0.0\n"
+                "loguru>=0.7.0,<0.8.0\n"
+                "\n"
+                "[dev]\n"
+                "pytest>=8.0.0\n"
+            ),
+        },
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid optional dependency dev: pytest>=8.0.0" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_extra_dependency(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            "dev = [123]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid optional dependency dev:123" in captured.err
+
+
+def test_distribution_check_rejects_non_list_pyproject_extra_dependencies(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = "pytest>=8.0.0"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid optional dependency list dev" in captured.err
+
+
+def test_distribution_check_rejects_non_table_pyproject_optional_dependencies(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            'optional-dependencies = "dev"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid optional dependencies table" in captured.err
+
+
+def test_distribution_check_rejects_wheel_extra_dependency_marker_mismatch(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "pytest>=8.0.0; extra == 'dev'",
+        ),
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=_pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+                "pytest>=8.0.0; python_version < '3.13' and extra == 'dev'",
+            ),
+            extras=("dev",),
+        ),
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            "dev = ['pytest>=8.0.0; python_version < \"3.13\"']\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA optional dependency mismatch for dev:pytest" in captured.err
+
+
+def test_distribution_check_rejects_sdist_pkg_info_metadata_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_extras=("dev",),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info="Name: fastapi-infra\nVersion: 0.2.0\n",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            'dev = ["pytest>=8.0.0"]\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist PKG-INFO Requires-Python mismatch: pyproject >=3.11, PKG-INFO <missing>" in (
+        captured.err
+    )
+    assert "sdist PKG-INFO missing required dependency loguru" in captured.err
+    assert "sdist PKG-INFO missing provided extra dev" in captured.err
+
+
+def test_distribution_check_rejects_invalid_sdist_pkg_info_requires_dist(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = _pkg_info_content(
+        name="fastapi-infra",
+        version="0.2.0",
+        requires_python=">=3.11",
+        dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+            "not a valid requirement !!!",
+        ),
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert (
+        "sdist PKG-INFO invalid Requires-Dist dependency not a valid requirement !!!"
+        in captured.err
+    )
+
+
+def test_distribution_check_rejects_wheel_requires_python_mismatch(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_requires_python=">=3.12",
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert (
+        "wheel METADATA Requires-Python mismatch: pyproject >=3.11, METADATA >=3.12" in captured.err
+    )
+
+
+def test_distribution_check_rejects_missing_wheel_metadata_version(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=_wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        ).replace("Metadata-Version: 2.4\n", ""),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA missing Metadata-Version" in captured.err
+
+
+def test_distribution_check_rejects_license_expression_with_old_metadata_version(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        ).replace("Metadata-Version: 2.4\n", "Metadata-Version: 2.3\n")
+        + "License-Expression: MIT\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA License-Expression requires Metadata-Version 2.4" in captured.err
+
+
+def test_distribution_check_rejects_dynamic_metadata_with_old_metadata_version(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        ).replace("Metadata-Version: 2.4\n", "Metadata-Version: 2.1\n")
+        + "Dynamic: license-file\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA Dynamic requires Metadata-Version 2.2" in captured.err
+
+
+def test_distribution_check_rejects_pyproject_dynamic_metadata_field(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'dynamic = ["version"]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject unexpected dynamic metadata field version",
+    )
+
+
+def test_distribution_check_rejects_pyproject_dynamic_metadata_field_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'dynamic = [" version"]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid dynamic metadata field ' version'",
+    )
+
+
+def test_distribution_check_rejects_wheel_dynamic_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Dynamic: Version\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA unexpected Dynamic metadata field Version" in captured.err
+
+
+def test_distribution_check_rejects_wheel_provides_dist_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Provides-Dist: fastapi-infra-legacy\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert (
+        "wheel METADATA unsupported Provides-Dist metadata field fastapi-infra-legacy"
+        in captured.err
+    )
+
+
+def test_distribution_check_rejects_wheel_legacy_provides_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Provides: fastapi-infra-legacy\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA unsupported Provides metadata field fastapi-infra-legacy" in (
+        captured.err
+    )
+
+
+def test_distribution_check_rejects_wheel_home_page_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Home-page: https://legacy.example.test\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA unsupported Home-page metadata field https://legacy.example.test" in (
+        captured.err
+    )
+
+
+def test_distribution_check_rejects_wheel_maintainer_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Maintainer: Release Team\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA unsupported Maintainer metadata field Release Team" in captured.err
+
+
+def test_distribution_check_rejects_pyproject_maintainers_field(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'requires-python = ">=3.11"',
+            'maintainers = [{ name = "Release Team" }]',
+        ),
+        "pyproject unsupported metadata field maintainers",
+    )
+
+
+def test_distribution_check_rejects_pyproject_gui_scripts_field(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            _pyproject_with_core_metadata(
+                'name = "fastapi-infra"',
+                'version = "0.2.0"',
+                'requires-python = ">=3.11"',
+            )
+            + "\n[project.gui-scripts]\n"
+            + 'fastapi-infra-gui = "infra.gui:main"\n'
+        ),
+        "pyproject unsupported metadata field gui-scripts",
+    )
+
+
+def test_distribution_check_rejects_pyproject_entry_points_field(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            _pyproject_with_core_metadata(
+                'name = "fastapi-infra"',
+                'version = "0.2.0"',
+                'requires-python = ">=3.11"',
+            )
+            + "\n[project.entry-points.fastapi_infra]\n"
+            + 'dev = "infra.dev:main"\n'
+        ),
+        "pyproject unsupported metadata field entry-points",
+    )
+
+
+def test_distribution_check_rejects_wheel_summary_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = _pkg_info_content(
+        name="fastapi-infra",
+        version="0.2.0",
+        requires_python=">=3.11",
+        dependencies=(
+            "fastapi>=0.117.1,<0.118.0",
+            "uvicorn[standard]>=0.37.0,<0.38.0",
+            "starlette>=0.48.0,<0.49.0",
+            "pydantic>=2.11.0,<3.0.0",
+            "pydantic-settings>=2.10.0,<3.0.0",
+            "loguru>=0.7.0,<0.8.0",
+        ),
+    ).replace("Version: 0.2.0\n", "Version: 0.2.0\nSummary: Stable release package\n")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'description = "Stable release package"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA Summary mismatch" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_description(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "description = 123\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        "pyproject invalid description 123",
+    )
+
+
+def test_distribution_check_rejects_pyproject_description_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'description = " Stable release package"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid description ' Stable release package'",
+    )
+
+
+def test_distribution_check_rejects_wheel_project_url_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Project-URL: Homepage, https://example.test\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.urls]\n"
+            'Homepage = "https://example.test"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA missing project URL Homepage" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_url(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.urls]\n"
+            "Homepage = 123\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid project URL Homepage:123" in captured.err
+
+
+def test_distribution_check_rejects_invalid_pyproject_url(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Project-URL: Homepage, not-a-url\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Project-URL: Homepage, not-a-url\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.urls]\n"
+            'Homepage = "not-a-url"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid project URL Homepage:'not-a-url'" in captured.err
+    assert "wheel METADATA invalid project URL metadata 'Homepage, not-a-url'" in captured.err
+    assert "sdist PKG-INFO invalid project URL metadata 'Homepage, not-a-url'" in captured.err
+
+
+def test_distribution_check_rejects_project_url_with_raw_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    url = "https://example.test/docs path"
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + f"Project-URL: Documentation, {url}\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + f"Project-URL: Documentation, {url}\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.urls]\n"
+            f'Documentation = "{url}"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert f"pyproject invalid project URL Documentation:{url!r}" in captured.err
+    assert f"wheel METADATA invalid project URL metadata 'Documentation, {url}'" in captured.err
+    assert f"sdist PKG-INFO invalid project URL metadata 'Documentation, {url}'" in captured.err
+
+
+def test_distribution_check_rejects_too_long_project_url_label(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    long_label = "DocumentationMirrorLinkThatIsTooLong"
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + f"Project-URL: {long_label}, https://example.test\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + f"Project-URL: {long_label}, https://example.test\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.urls]\n"
+            f'{long_label} = "https://example.test"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert f"pyproject invalid project URL label {long_label!r}" in captured.err
+    assert f"wheel METADATA invalid project URL label metadata {long_label!r}" in captured.err
+    assert f"sdist PKG-INFO invalid project URL label metadata {long_label!r}" in captured.err
+
+
+def test_distribution_check_rejects_project_url_label_with_comma(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    label = "Docs,Mirror"
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + f"Project-URL: {label}, https://example.test\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + f"Project-URL: {label}, https://example.test\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.urls]\n"
+            f'"{label}" = "https://example.test"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert f"pyproject invalid project URL label {label!r}" in captured.err
+    assert f"wheel METADATA invalid project URL label metadata {label!r}" in captured.err
+    assert f"sdist PKG-INFO invalid project URL label metadata {label!r}" in captured.err
+
+
+def test_distribution_check_rejects_malformed_wheel_project_url_metadata(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Project-URL: Homepage https://example.test\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA malformed project URL metadata 'Homepage https://example.test'" in (
+        captured.err
+    )
+
+
+def test_distribution_check_rejects_duplicate_wheel_project_url_metadata_without_pyproject(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Project-URL: Homepage, https://example.test\n"
+        + "Project-URL: Homepage, https://mirror.example.test\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate project URL Homepage" in captured.err
+
+
+def test_distribution_check_rejects_case_variant_project_url_labels(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Project-URL: Homepage, https://example.test\n"
+        + "Project-URL: homepage, https://mirror.example.test\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Project-URL: Homepage, https://example.test\n"
+        + "Project-URL: homepage, https://mirror.example.test\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.urls]\n"
+            'Homepage = "https://example.test"\n'
+            'homepage = "https://mirror.example.test"\n'
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject duplicate project URL label homepage" in captured.err
+    assert "wheel METADATA duplicate project URL label homepage" in captured.err
+    assert "sdist PKG-INFO duplicate project URL label homepage" in captured.err
+
+
+def test_distribution_check_rejects_wheel_license_expression_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "License-Expression: MIT\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'license = "MIT"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA License-Expression mismatch" in captured.err
+
+
+def test_distribution_check_rejects_invalid_wheel_license_expression_without_pyproject(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "License-Expression: not a license\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA invalid License-Expression 'not a license'" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_license(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "license = 123\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        "pyproject invalid license 123",
+    )
+
+
+def test_distribution_check_rejects_invalid_pyproject_license_expression(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license = "not a license"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid license expression 'not a license'",
+    )
+
+
+def test_distribution_check_rejects_pyproject_license_expression_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license = " MIT"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid license expression ' MIT'",
+    )
+
+
+def test_distribution_check_rejects_wheel_keywords_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Keywords: fastapi,infrastructure\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'keywords = ["fastapi", "infrastructure"]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA Keywords mismatch" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_keyword(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "keywords = [123]\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid keyword 123" in captured.err
+
+
+def test_distribution_check_rejects_pyproject_keyword_with_comma(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'keywords = ["fastapi,infra"]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid keyword 'fastapi,infra'",
+    )
+
+
+def test_distribution_check_rejects_non_list_pyproject_keywords(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'keywords = "fastapi"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        "pyproject invalid keywords list 'fastapi'",
+    )
+
+
+def test_distribution_check_rejects_duplicate_pyproject_keyword(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Keywords: fastapi, fastapi\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Keywords: fastapi, fastapi\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'keywords = ["fastapi", "fastapi"]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject duplicate keyword fastapi" in captured.err
+
+
+def test_distribution_check_rejects_wheel_classifier_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Classifier: Framework :: FastAPI\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'classifiers = ["Framework :: FastAPI"]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA missing classifier Framework :: FastAPI" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_classifier(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "classifiers = [123]\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid classifier 123" in captured.err
+
+
+def test_distribution_check_rejects_blank_pyproject_classifier(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'classifiers = [""]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid classifier ''",
+    )
+
+
+def test_distribution_check_rejects_pyproject_classifier_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'classifiers = [" Framework :: FastAPI"]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid classifier ' Framework :: FastAPI'",
+    )
+
+
+def test_distribution_check_rejects_non_list_pyproject_classifiers(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'classifiers = "Framework :: FastAPI"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        "pyproject invalid classifiers list 'Framework :: FastAPI'",
+    )
+
+
+def test_distribution_check_rejects_duplicate_pyproject_classifier(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Classifier: Framework :: FastAPI\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Classifier: Framework :: FastAPI\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'classifiers = ["Framework :: FastAPI", "Framework :: FastAPI"]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject duplicate classifier Framework :: FastAPI" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_classifier_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Classifier: Framework :: FastAPI\n"
+        + "Classifier: Framework :: FastAPI\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Classifier: Framework :: FastAPI\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'classifiers = ["Framework :: FastAPI"]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate classifier metadata Framework :: FastAPI" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_classifier_metadata_without_pyproject(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Classifier: Framework :: FastAPI\n"
+        + "Classifier: Framework :: FastAPI\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate classifier metadata Framework :: FastAPI" in captured.err
+
+
+def test_distribution_check_rejects_wheel_author_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Author: AIMidPlatform Team\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'authors = [{ name = "AIMidPlatform Team" }]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA Author mismatch" in captured.err
+
+
+def test_distribution_check_rejects_missing_author_email_metadata(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Author: AIMidPlatform Team\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Author: AIMidPlatform Team\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'authors = [{ name = "AIMidPlatform Team", email = "team@example.test" }]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA Author-email mismatch" in captured.err
+    assert "sdist PKG-INFO Author-email mismatch" in captured.err
+
+
+def test_distribution_check_accepts_author_email_metadata(tmp_path) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    author_email = "AIMidPlatform Team <team@example.test>"
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + f"Author-email: {author_email}\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + f"Author-email: {author_email}\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'authors = [{ name = "AIMidPlatform Team", email = "team@example.test" }]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 0
+
+
+def test_distribution_check_rejects_non_table_pyproject_author(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "authors = [123]\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid author 123" in captured.err
+
+
+def test_distribution_check_rejects_empty_pyproject_author_table(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            "authors = [{}]",
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid author {}",
+    )
+
+
+def test_distribution_check_rejects_non_list_pyproject_authors(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'authors = "AIMidPlatform Team"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        "pyproject invalid authors list 'AIMidPlatform Team'",
+    )
+
+
+def test_distribution_check_rejects_non_string_pyproject_author_name(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "authors = [{ name = 123 }]\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid author name 123" in captured.err
+
+
+def test_distribution_check_rejects_blank_pyproject_author_name(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'authors = [{ name = "" }]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid author name ''",
+    )
+
+
+def test_distribution_check_rejects_pyproject_author_name_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'authors = [{ name = " AIMidPlatform Team" }]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid author name ' AIMidPlatform Team'",
+    )
+
+
+def test_distribution_check_rejects_unsupported_pyproject_author_field(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'authors = [{ name = "AIMidPlatform Team", url = "https://example.test" }]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject unsupported author field url",
+    )
+
+
+def test_distribution_check_rejects_non_string_pyproject_author_email(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "authors = [{ email = 123 }]\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid author email 123" in captured.err
+
+
+def test_distribution_check_rejects_blank_pyproject_author_email(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'authors = [{ email = "" }]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid author email ''",
+    )
+
+
+def test_distribution_check_rejects_malformed_pyproject_author_email(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'authors = [{ email = "not-email" }]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid author email 'not-email'",
+    )
+
+
+def test_distribution_check_rejects_duplicate_pyproject_author(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Author: AIMidPlatform Team, AIMidPlatform Team\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Author: AIMidPlatform Team, AIMidPlatform Team\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'authors = [{ name = "AIMidPlatform Team" }, { name = "AIMidPlatform Team" }]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject duplicate author AIMidPlatform Team" in captured.err
+
+
+def test_distribution_check_rejects_non_table_pyproject_urls(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'urls = "https://example.test"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        "pyproject invalid project URLs table 'https://example.test'",
+    )
+
+
+def test_distribution_check_rejects_duplicate_wheel_author_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Author: AIMidPlatform Team\n"
+        + "Author: Other Team\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Author: AIMidPlatform Team\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'authors = [{ name = "AIMidPlatform Team" }]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate Author metadata field" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_name_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Name: fastapi-infra\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate Name metadata field" in captured.err
+
+
+def test_distribution_check_rejects_wheel_readme_content_type_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Description-Content-Type: text/markdown\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'readme = "README.md"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA Description-Content-Type mismatch" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_readme(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "readme = 123\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid readme 123" in captured.err
+
+
+def test_distribution_check_rejects_unknown_pyproject_readme_content_type(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'readme = "README.foo"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid readme content type README.foo",
+    )
+
+
+def test_distribution_check_rejects_blank_pyproject_readme_path(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'readme = ""',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid readme path ''",
+    )
+
+
+def test_distribution_check_rejects_pyproject_readme_path_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'readme = " README.md"',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid readme path ' README.md'",
+    )
+
+
+def test_distribution_check_rejects_missing_pyproject_readme_file(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Description-Content-Type: text/markdown\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Description-Content-Type: text/markdown\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'readme = "docs/README.md"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist missing pyproject readme file docs/README.md" in captured.err
+
+
+def test_distribution_check_rejects_unsafe_pyproject_readme_path(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "Description-Content-Type: text/markdown\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "Description-Content-Type: text/markdown\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'readme = "../README.md"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid readme path '../README.md'" in captured.err
+
+
+def test_distribution_check_rejects_wheel_license_file_metadata_drift(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "License-File: LICENSE\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'license-files = ["LICENSE"]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA missing license file metadata LICENSE" in captured.err
+
+
+def test_distribution_check_rejects_non_string_pyproject_license_file(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            "license-files = [123]\n"
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject invalid license file 123" in captured.err
+
+
+def test_distribution_check_rejects_unsafe_pyproject_license_file_path(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license-files = ["../LICENSE"]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid license file path '../LICENSE'",
+    )
+
+
+def test_distribution_check_rejects_blank_pyproject_license_file_path(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license-files = [""]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid license file path ''",
+    )
+
+
+def test_distribution_check_rejects_pyproject_license_file_path_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license-files = [" LICENSE"]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid license file path ' LICENSE'",
+    )
+
+
+def test_distribution_check_rejects_pyproject_license_file_path_with_trailing_slash(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license-files = ["LICENSE/"]',
+            'requires-python = ">=3.11"',
+        ),
+        "pyproject invalid license file path 'LICENSE/'",
+    )
+
+
+def test_distribution_check_rejects_duplicate_pyproject_license_file(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "License-File: LICENSE\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "License-File: LICENSE\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=_pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license-files = ["LICENSE", "LICENSE"]',
+            'requires-python = ">=3.11"',
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "pyproject duplicate license file LICENSE" in captured.err
+
+
+def test_distribution_check_rejects_missing_sdist_pyproject_license_file(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=(
+            _wheel_metadata_content(
+                name="fastapi-infra",
+                version="0.2.0",
+                requires_python=">=3.11",
+                dependencies=(
+                    "fastapi>=0.117.1,<0.118.0",
+                    "uvicorn[standard]>=0.37.0,<0.38.0",
+                    "starlette>=0.48.0,<0.49.0",
+                    "pydantic>=2.11.0,<3.0.0",
+                    "pydantic-settings>=2.10.0,<3.0.0",
+                    "loguru>=0.7.0,<0.8.0",
+                ),
+                extras=(),
+            )
+            + "License-File: NOTICE\n"
+        ),
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "License-File: NOTICE\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=_pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license-files = ["NOTICE"]',
+            'requires-python = ">=3.11"',
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "sdist missing pyproject license file NOTICE" in captured.err
+
+
+def test_distribution_check_rejects_non_list_pyproject_license_files(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        (
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'license-files = "LICENSE"\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+        "pyproject invalid license files list 'LICENSE'",
+    )
+
+
+def test_distribution_check_rejects_duplicate_wheel_license_file_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "License-File: LICENSE\n"
+        + "License-File: LICENSE\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "License-File: LICENSE\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=(
+            "[project]\n"
+            'name = "fastapi-infra"\n'
+            'version = "0.2.0"\n'
+            'license-files = ["LICENSE"]\n'
+            'requires-python = ">=3.11"\n'
+            "dependencies = [\n"
+            '    "fastapi>=0.117.1,<0.118.0",\n'
+            '    "uvicorn[standard]>=0.37.0,<0.38.0",\n'
+            '    "starlette>=0.48.0,<0.49.0",\n'
+            '    "pydantic>=2.11.0,<3.0.0",\n'
+            '    "pydantic-settings>=2.10.0,<3.0.0",\n'
+            '    "loguru>=0.7.0,<0.8.0",\n'
+            "]\n"
+            "\n"
+            "[project.scripts]\n"
+            'fastapi-infra = "infra.cli:main"\n'
+        ),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate license file metadata LICENSE" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_license_file_metadata_without_pyproject(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "License-File: LICENSE\n"
+        + "License-File: LICENSE\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA duplicate license file metadata LICENSE" in captured.err
+
+
+def test_distribution_check_rejects_unsafe_wheel_license_file_metadata_without_pyproject(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "License-File: ../LICENSE\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel METADATA unsafe license file metadata ../LICENSE" in captured.err
 
 
 def test_distribution_check_rejects_wheel_dist_info_directory_mismatch(tmp_path, capsys) -> None:
@@ -442,6 +5384,57 @@ def test_distribution_check_rejects_missing_console_entry_point(tmp_path, capsys
     assert "missing console script entry point fastapi-infra = infra.cli:main" in captured.err
 
 
+def test_distribution_check_rejects_unexpected_console_entry_point(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        entry_points=(
+            "[console_scripts]\n"
+            "fastapi-infra = infra.cli:main\n"
+            "fastapi-infra-dev = infra.dev:main\n"
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert (
+        "unexpected console script entry point fastapi-infra-dev = infra.dev:main" in captured.err
+    )
+
+
+def test_distribution_check_rejects_case_mismatched_console_entry_point(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        entry_points="[console_scripts]\nFastAPI-Infra = infra.cli:main\n",
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "missing console script entry point fastapi-infra = infra.cli:main" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_wheel_entry_point_section(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        entry_points=(
+            "[console_scripts]\n"
+            "fastapi-infra = infra.cli:main\n"
+            "\n"
+            "[gui_scripts]\n"
+            "fastapi-infra-gui = infra.gui:main\n"
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "unexpected entry point section gui_scripts" in captured.err
+
+
 def test_distribution_check_rejects_missing_wheel_license_file(tmp_path, capsys) -> None:
     module = _load_script("scripts/check_distribution.py")
     wheel = _write_clean_wheel(
@@ -455,6 +5448,136 @@ def test_distribution_check_rejects_missing_wheel_license_file(tmp_path, capsys)
     assert "missing required wheel license file LICENSE" in captured.err
 
 
+def test_distribution_check_accepts_declared_additional_license_file(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "License-File: NOTICE\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+        extra_files=("fastapi_infra-0.2.0.dist-info/licenses/NOTICE",),
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "License-File: NOTICE\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=_pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license-files = ["NOTICE"]',
+            'requires-python = ">=3.11"',
+        ),
+        extra_files=("NOTICE",),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 0
+
+
+def test_distribution_check_rejects_missing_wheel_metadata_license_file(
+    tmp_path,
+    capsys,
+) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    metadata_content = (
+        _wheel_metadata_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+            extras=(),
+        )
+        + "License-File: NOTICE\n"
+    )
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        metadata_content=metadata_content,
+    )
+    pkg_info = (
+        _pkg_info_content(
+            name="fastapi-infra",
+            version="0.2.0",
+            requires_python=">=3.11",
+            dependencies=(
+                "fastapi>=0.117.1,<0.118.0",
+                "uvicorn[standard]>=0.37.0,<0.38.0",
+                "starlette>=0.48.0,<0.49.0",
+                "pydantic>=2.11.0,<3.0.0",
+                "pydantic-settings>=2.10.0,<3.0.0",
+                "loguru>=0.7.0,<0.8.0",
+            ),
+        )
+        + "License-File: NOTICE\n"
+    )
+    source = _write_clean_sdist(
+        tmp_path / "fastapi_infra-0.2.0.tar.gz",
+        pkg_info=pkg_info,
+        pyproject=_pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'license-files = ["NOTICE"]',
+            'requires-python = ">=3.11"',
+        ),
+        extra_files=("NOTICE",),
+    )
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel missing metadata license file NOTICE" in captured.err
+
+
+def test_distribution_check_rejects_wheel_license_directory(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        directory_entries=("fastapi_infra-0.2.0.dist-info/licenses/LICENSE",),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "required wheel license file is not a regular file LICENSE" in captured.err
+
+
 def test_distribution_check_rejects_missing_top_level_package(tmp_path, capsys) -> None:
     module = _load_script("scripts/check_distribution.py")
     wheel = _write_clean_wheel(
@@ -466,6 +5589,32 @@ def test_distribution_check_rejects_missing_top_level_package(tmp_path, capsys) 
     assert module.main([str(wheel), str(source)]) == 1
     captured = capsys.readouterr()
     assert "wheel top_level.txt missing required top-level package infra" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_top_level_package(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        top_level="infra\nother\n",
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel top_level.txt unexpected top-level package other" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_top_level_package(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        top_level="infra\ninfra\n",
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel top_level.txt duplicate top-level package infra" in captured.err
 
 
 def test_distribution_check_rejects_wheel_record_missing_required_file(tmp_path, capsys) -> None:
@@ -567,6 +5716,90 @@ def test_distribution_check_rejects_missing_wheel_record_hash_and_size(tmp_path,
     assert module.main([str(wheel), str(source)]) == 1
     captured = capsys.readouterr()
     assert "wheel RECORD entry infra/__init__.py missing hash or size" in captured.err
+
+
+def test_distribution_check_rejects_non_numeric_wheel_record_size(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        record_content=(
+            "infra/__init__.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "infra/cli.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,not-a-number\n"
+            "infra/scaffold.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "infra/provider_tests/test_live_providers.py,"
+            "sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "fastapi_infra-0.2.0.dist-info/METADATA,"
+            "sha256=8XSdrWB-dz17IPWrLRFjrEF-WZR4sMNKVTj9YfZAvJY,34\n"
+            "fastapi_infra-0.2.0.dist-info/WHEEL,"
+            "sha256=AHkFS8lAXaeyj7jVnWdqOCr__GWc3uGb-fWzH9kB2rw,52\n"
+            "fastapi_infra-0.2.0.dist-info/entry_points.txt,"
+            "sha256=vr2RUdI6i2zi3nnOJq8a55crsYyKkhKLWV11hmfffOc,49\n"
+            "fastapi_infra-0.2.0.dist-info/top_level.txt,"
+            "sha256=QULNvXR7YSuRmB0OWJD88JBBz9PPFe9s9_4dS_WQpt0,6\n"
+            "fastapi_infra-0.2.0.dist-info/RECORD,,\n"
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "invalid wheel RECORD size for infra/cli.py: not-a-number" in captured.err
+
+
+def test_distribution_check_rejects_non_sha256_wheel_record_hash(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        record_content=(
+            "infra/__init__.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "infra/cli.py,md5=1B2M2Y8AsgTpgAmY7PhCfg,0\n"
+            "infra/scaffold.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "infra/provider_tests/test_live_providers.py,"
+            "sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "fastapi_infra-0.2.0.dist-info/METADATA,"
+            "sha256=8XSdrWB-dz17IPWrLRFjrEF-WZR4sMNKVTj9YfZAvJY,34\n"
+            "fastapi_infra-0.2.0.dist-info/WHEEL,"
+            "sha256=AHkFS8lAXaeyj7jVnWdqOCr__GWc3uGb-fWzH9kB2rw,52\n"
+            "fastapi_infra-0.2.0.dist-info/entry_points.txt,"
+            "sha256=vr2RUdI6i2zi3nnOJq8a55crsYyKkhKLWV11hmfffOc,49\n"
+            "fastapi_infra-0.2.0.dist-info/top_level.txt,"
+            "sha256=QULNvXR7YSuRmB0OWJD88JBBz9PPFe9s9_4dS_WQpt0,6\n"
+            "fastapi_infra-0.2.0.dist-info/RECORD,,\n"
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "invalid wheel RECORD hash algorithm for infra/cli.py: md5" in captured.err
+
+
+def test_distribution_check_rejects_invalid_wheel_record_hash_value(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        record_content=(
+            "infra/__init__.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "infra/cli.py,sha256=not-a-valid-digest!,0\n"
+            "infra/scaffold.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "infra/provider_tests/test_live_providers.py,"
+            "sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0\n"
+            "fastapi_infra-0.2.0.dist-info/METADATA,"
+            "sha256=8XSdrWB-dz17IPWrLRFjrEF-WZR4sMNKVTj9YfZAvJY,34\n"
+            "fastapi_infra-0.2.0.dist-info/WHEEL,"
+            "sha256=AHkFS8lAXaeyj7jVnWdqOCr__GWc3uGb-fWzH9kB2rw,52\n"
+            "fastapi_infra-0.2.0.dist-info/entry_points.txt,"
+            "sha256=vr2RUdI6i2zi3nnOJq8a55crsYyKkhKLWV11hmfffOc,49\n"
+            "fastapi_infra-0.2.0.dist-info/top_level.txt,"
+            "sha256=QULNvXR7YSuRmB0OWJD88JBBz9PPFe9s9_4dS_WQpt0,6\n"
+            "fastapi_infra-0.2.0.dist-info/RECORD,,\n"
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "invalid wheel RECORD hash value for infra/cli.py: not-a-valid-digest!" in captured.err
 
 
 def test_distribution_check_rejects_duplicate_wheel_record_entry(tmp_path, capsys) -> None:
@@ -684,6 +5917,86 @@ def test_distribution_check_rejects_wheel_tag_mismatch(tmp_path, capsys) -> None
     ) in captured.err
 
 
+def test_distribution_check_rejects_missing_wheel_version_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        wheel_metadata="Root-Is-Purelib: true\nTag: py3-none-any\n",
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel WHEEL missing Wheel-Version: 1.0" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_version_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        wheel_metadata=(
+            "Wheel-Version: 1.0\n"
+            "Wheel-Version: 1.0\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel WHEEL duplicate Wheel-Version metadata field" in captured.err
+
+
+def test_distribution_check_rejects_duplicate_wheel_tag_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        wheel_metadata=(
+            "Wheel-Version: 1.0\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+            "Tag: py3-none-any\n"
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel WHEEL duplicate Tag metadata py3-none-any" in captured.err
+
+
+def test_distribution_check_rejects_unexpected_wheel_tag_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        wheel_metadata=(
+            "Wheel-Version: 1.0\n"
+            "Root-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+            "Tag: cp311-cp311-macosx_11_0_arm64\n"
+        ),
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel WHEEL unexpected Tag metadata cp311-cp311-macosx_11_0_arm64" in (captured.err)
+
+
+def test_distribution_check_rejects_non_purelib_wheel_metadata(tmp_path, capsys) -> None:
+    module = _load_script("scripts/check_distribution.py")
+    wheel = _write_clean_wheel(
+        tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl",
+        wheel_metadata="Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: py3-none-any\n",
+    )
+    source = _write_clean_sdist(tmp_path / "fastapi_infra-0.2.0.tar.gz")
+
+    assert module.main([str(wheel), str(source)]) == 1
+    captured = capsys.readouterr()
+    assert "wheel WHEEL Root-Is-Purelib must be true" in captured.err
+
+
 def test_distribution_check_rejects_missing_sdist_console_script(tmp_path, capsys) -> None:
     module = _load_script("scripts/check_distribution.py")
     wheel = _write_clean_wheel(tmp_path / "fastapi_infra-0.2.0-py3-none-any.whl")
@@ -696,6 +6009,89 @@ def test_distribution_check_rejects_missing_sdist_console_script(tmp_path, capsy
     captured = capsys.readouterr()
     assert "sdist pyproject.toml missing project.scripts.fastapi-infra = infra.cli:main" in (
         captured.err
+    )
+
+
+def test_distribution_check_rejects_non_table_pyproject_scripts(tmp_path, capsys) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'requires-python = ">=3.11"',
+            'scripts = "infra.cli:main"',
+            scripts=None,
+        ),
+        "pyproject invalid project.scripts table 'infra.cli:main'",
+    )
+
+
+def test_distribution_check_rejects_non_string_pyproject_console_script(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'requires-python = ">=3.11"',
+            scripts="fastapi-infra = 123",
+        ),
+        "pyproject invalid project.scripts.fastapi-infra 123",
+    )
+
+
+def test_distribution_check_rejects_pyproject_console_script_with_outer_whitespace(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'requires-python = ">=3.11"',
+            scripts='fastapi-infra = " infra.cli:main"',
+        ),
+        "pyproject invalid project.scripts.fastapi-infra ' infra.cli:main'",
+    )
+
+
+def test_distribution_check_rejects_unexpected_pyproject_console_script(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'requires-python = ">=3.11"',
+            scripts=('fastapi-infra = "infra.cli:main"\n' 'fastapi-infra-dev = "infra.dev:main"'),
+        ),
+        "pyproject unexpected project.scripts.fastapi-infra-dev = infra.dev:main",
+    )
+
+
+def test_distribution_check_rejects_non_string_unexpected_pyproject_console_script(
+    tmp_path,
+    capsys,
+) -> None:
+    _assert_distribution_check_rejects_pyproject(
+        tmp_path,
+        capsys,
+        _pyproject_with_core_metadata(
+            'name = "fastapi-infra"',
+            'version = "0.2.0"',
+            'requires-python = ">=3.11"',
+            scripts='fastapi-infra = "infra.cli:main"\nfastapi-infra-dev = 123',
+        ),
+        "pyproject invalid project.scripts.fastapi-infra-dev 123",
     )
 
 
@@ -752,11 +6148,16 @@ def _write_clean_wheel(
     wheel_metadata: str = "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
     entry_points: str = "[console_scripts]\nfastapi-infra = infra.cli:main\n",
     top_level: str = "infra\n",
+    metadata_requires_python: str = ">=3.11",
+    metadata_dependencies: tuple[str, ...] = DEFAULT_METADATA_DEPENDENCIES,
+    metadata_extras: tuple[str, ...] = (),
+    metadata_content: str | bytes | None = None,
     record_content: str | None = None,
     record_extra: str = "",
     record_self_fields: str = ",",
     symlink_entries: Mapping[str, str] | None = None,
     directory_entries: tuple[str, ...] = (),
+    extra_files: tuple[str, ...] = (),
     include_license: bool = True,
 ) -> Path:
     entries = [
@@ -764,15 +6165,28 @@ def _write_clean_wheel(
         "infra/cli.py",
         "infra/scaffold.py",
         "infra/provider_tests/test_live_providers.py",
+        *extra_files,
     ]
     version = metadata_version or path.name.split("-", 2)[1]
     directories = set(directory_entries)
-    archive_contents = {entry: "" for entry in entries if entry not in directories}
+    archive_contents: dict[str, str | bytes] = {
+        entry: "" for entry in entries if entry not in directories
+    }
     links = symlink_entries or {}
     archive_contents.update(links)
     archive_contents.update(
         {
-            f"{dist_info_dir}/METADATA": f"Name: {metadata_name}\nVersion: {version}\n",
+            f"{dist_info_dir}/METADATA": (
+                metadata_content
+                if metadata_content is not None
+                else _wheel_metadata_content(
+                    name=metadata_name,
+                    version=version,
+                    requires_python=metadata_requires_python,
+                    dependencies=metadata_dependencies,
+                    extras=metadata_extras,
+                )
+            ),
             f"{dist_info_dir}/WHEEL": wheel_metadata,
             f"{dist_info_dir}/entry_points.txt": entry_points,
             f"{dist_info_dir}/top_level.txt": top_level,
@@ -806,15 +6220,82 @@ def _write_clean_wheel(
     return path
 
 
-def _wheel_record_content(
-    archive_contents: dict[str, str], record_path: str, record_self_fields: str
+def _wheel_metadata_content(
+    *,
+    name: str,
+    version: str,
+    requires_python: str,
+    dependencies: tuple[str, ...],
+    extras: tuple[str, ...],
 ) -> str:
-    records = [
-        f"{entry},{_record_hash(content.encode('utf-8'))},{len(content.encode('utf-8'))}\n"
-        for entry, content in archive_contents.items()
+    return _core_metadata_content(
+        name=name,
+        version=version,
+        requires_python=requires_python,
+        dependencies=dependencies,
+        extras=extras,
+    )
+
+
+def _pkg_info_content(
+    *,
+    name: str,
+    version: str,
+    requires_python: str,
+    dependencies: tuple[str, ...],
+    extras: tuple[str, ...] = (),
+) -> str:
+    return _core_metadata_content(
+        name=name,
+        version=version,
+        requires_python=requires_python,
+        dependencies=dependencies,
+        extras=extras,
+    )
+
+
+def _core_metadata_content(
+    *,
+    name: str,
+    version: str,
+    requires_python: str,
+    dependencies: tuple[str, ...],
+    extras: tuple[str, ...] = (),
+) -> str:
+    lines = [
+        "Metadata-Version: 2.4",
+        f"Name: {name}",
+        f"Version: {version}",
+        f"Requires-Python: {requires_python}",
     ]
+    lines.extend(f"Requires-Dist: {dependency}" for dependency in dependencies)
+    lines.extend(f"Provides-Extra: {extra}" for extra in extras)
+    return "\n".join(lines) + "\n"
+
+
+def _requires_txt_content() -> str:
+    return DEFAULT_REQUIRES_TXT
+
+
+def _sources_txt_content(entries: Sequence[str]) -> str:
+    return "\n".join(entry for entry in entries if entry != "setup.cfg") + "\n"
+
+
+def _wheel_record_content(
+    archive_contents: dict[str, str | bytes], record_path: str, record_self_fields: str
+) -> str:
+    records = []
+    for entry, content in archive_contents.items():
+        content_bytes = _content_bytes(content)
+        records.append(f"{entry},{_record_hash(content_bytes)},{len(content_bytes)}\n")
     records.append(f"{record_path},{record_self_fields}\n")
     return "".join(records)
+
+
+def _content_bytes(content: str | bytes) -> bytes:
+    if isinstance(content, bytes):
+        return content
+    return content.encode("utf-8")
 
 
 def _record_hash(content: bytes) -> str:
@@ -827,6 +6308,7 @@ def _write_clean_sdist(
     *,
     metadata_name: str = "fastapi-infra",
     metadata_version: str | None = None,
+    pkg_info: str | bytes | None = None,
     pyproject: str | None = None,
     root_dir: str | None = None,
     root_files: tuple[str, ...] = (),
@@ -834,8 +6316,49 @@ def _write_clean_sdist(
     symlink_entries: Mapping[str, str] | None = None,
     root_symlink_target: str | None = None,
     directory_entries: tuple[str, ...] = (),
+    extra_files: tuple[str, ...] = (),
+    extra_file_contents: Mapping[str, str | bytes] | None = None,
 ) -> Path:
-    entries = [
+    root = root_dir or path.name.removesuffix(".tar.gz").removesuffix(".tgz")
+    version = metadata_version or root.rsplit("-", 1)[1]
+    entries = _clean_sdist_entries(extra_files)
+    pyproject_content = pyproject if pyproject is not None else _default_pyproject_content(version)
+    links = symlink_entries or {}
+    directories = set(directory_entries)
+    extra_contents = extra_file_contents or {}
+    with tarfile.open(path, "w:gz") as archive:
+        _add_sdist_root_entry(
+            archive,
+            path.parent / root,
+            root,
+            root_symlink_target=root_symlink_target,
+            include_root_dir_entry=include_root_dir_entry,
+        )
+        for entry in entries:
+            _add_clean_sdist_entry(
+                archive,
+                path.parent / root,
+                root,
+                entry,
+                entries=entries,
+                directories=directories,
+                links=links,
+                extra_contents=extra_contents,
+                metadata_name=metadata_name,
+                version=version,
+                pkg_info=pkg_info,
+                pyproject_content=pyproject_content,
+            )
+        for entry in root_files:
+            source = path.parent / entry
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("", encoding="utf-8")
+            archive.add(source, arcname=entry)
+    return path
+
+
+def _clean_sdist_entries(extra_files: tuple[str, ...]) -> list[str]:
+    return [
         "infra/__init__.py",
         "infra/cli.py",
         "infra/scaffold.py",
@@ -845,60 +6368,127 @@ def _write_clean_sdist(
         "MANIFEST.in",
         "README.md",
         "pyproject.toml",
+        *extra_files,
     ]
-    root = root_dir or path.name.removesuffix(".tar.gz").removesuffix(".tgz")
-    version = metadata_version or root.rsplit("-", 1)[1]
-    pyproject_content = (
-        pyproject
-        if pyproject is not None
-        else (
-            "[project]\n"
-            'name = "fastapi-infra"\n'
-            f'version = "{version}"\n'
-            "\n"
-            "[project.scripts]\n"
-            'fastapi-infra = "infra.cli:main"\n'
-        )
+
+
+def _default_pyproject_content(version: str) -> str:
+    return (
+        "[project]\n"
+        'name = "fastapi-infra"\n'
+        f'version = "{version}"\n'
+        'requires-python = ">=3.11"\n'
+        "dependencies = [\n"
+        + "".join(f'    "{dependency}",\n' for dependency in DEFAULT_METADATA_DEPENDENCIES)
+        + "]\n"
+        "\n"
+        "[project.scripts]\n"
+        'fastapi-infra = "infra.cli:main"\n'
     )
-    links = symlink_entries or {}
-    directories = set(directory_entries)
-    with tarfile.open(path, "w:gz") as archive:
-        if root_symlink_target is not None:
-            info = tarfile.TarInfo(root)
-            info.type = tarfile.SYMTYPE
-            info.linkname = root_symlink_target
-            archive.addfile(info)
-        if include_root_dir_entry:
-            root_source = path.parent / root
-            root_source.mkdir(parents=True, exist_ok=True)
-            archive.add(root_source, arcname=root, recursive=False)
-        for entry in entries:
-            source = path.parent / root / entry
-            source.parent.mkdir(parents=True, exist_ok=True)
-            if entry in directories:
-                source.mkdir(parents=True, exist_ok=True)
-                archive.add(source, arcname=f"{root}/{entry}", recursive=False)
-                continue
-            if entry in links:
-                info = tarfile.TarInfo(f"{root}/{entry}")
-                info.type = tarfile.SYMTYPE
-                info.linkname = links[entry]
-                archive.addfile(info)
-                continue
-            if entry == "PKG-INFO":
-                content = f"Name: {metadata_name}\nVersion: {version}\n"
-            elif entry == "pyproject.toml":
-                content = pyproject_content
-            else:
-                content = ""
-            source.write_text(content, encoding="utf-8")
-            archive.add(source, arcname=f"{root}/{entry}")
-        for entry in root_files:
-            source = path.parent / entry
-            source.parent.mkdir(parents=True, exist_ok=True)
-            source.write_text("", encoding="utf-8")
-            archive.add(source, arcname=entry)
-    return path
+
+
+def _add_sdist_root_entry(
+    archive: tarfile.TarFile,
+    root_source: Path,
+    root: str,
+    *,
+    root_symlink_target: str | None,
+    include_root_dir_entry: bool,
+) -> None:
+    if root_symlink_target is not None:
+        info = tarfile.TarInfo(root)
+        info.type = tarfile.SYMTYPE
+        info.linkname = root_symlink_target
+        archive.addfile(info)
+    if include_root_dir_entry:
+        root_source.mkdir(parents=True, exist_ok=True)
+        archive.add(root_source, arcname=root, recursive=False)
+
+
+def _add_clean_sdist_entry(
+    archive: tarfile.TarFile,
+    root_source: Path,
+    root: str,
+    entry: str,
+    *,
+    entries: Sequence[str],
+    directories: set[str],
+    links: Mapping[str, str],
+    extra_contents: Mapping[str, str | bytes],
+    metadata_name: str,
+    version: str,
+    pkg_info: str | bytes | None,
+    pyproject_content: str,
+) -> None:
+    source = root_source / entry
+    source.parent.mkdir(parents=True, exist_ok=True)
+    if entry in directories:
+        source.mkdir(parents=True, exist_ok=True)
+        archive.add(source, arcname=f"{root}/{entry}", recursive=False)
+        return
+    if entry in links:
+        info = tarfile.TarInfo(f"{root}/{entry}")
+        info.type = tarfile.SYMTYPE
+        info.linkname = links[entry]
+        archive.addfile(info)
+        return
+    content = _clean_sdist_entry_content(
+        entry,
+        entries=entries,
+        extra_contents=extra_contents,
+        metadata_name=metadata_name,
+        version=version,
+        pkg_info=pkg_info,
+        pyproject_content=pyproject_content,
+    )
+    _write_sdist_source(source, content)
+    archive.add(source, arcname=f"{root}/{entry}")
+
+
+def _clean_sdist_entry_content(
+    entry: str,
+    *,
+    entries: Sequence[str],
+    extra_contents: Mapping[str, str | bytes],
+    metadata_name: str,
+    version: str,
+    pkg_info: str | bytes | None,
+    pyproject_content: str,
+) -> str | bytes:
+    if entry == "PKG-INFO":
+        return pkg_info or _pkg_info_content(
+            name=metadata_name,
+            version=version,
+            requires_python=">=3.11",
+            dependencies=DEFAULT_METADATA_DEPENDENCIES,
+        )
+    if entry == "pyproject.toml":
+        return pyproject_content
+    if entry in extra_contents:
+        return extra_contents[entry]
+    if entry == "fastapi_infra.egg-info/PKG-INFO":
+        return _pkg_info_content(
+            name=metadata_name,
+            version=version,
+            requires_python=">=3.11",
+            dependencies=DEFAULT_METADATA_DEPENDENCIES,
+        )
+    if entry == "fastapi_infra.egg-info/entry_points.txt":
+        return "[console_scripts]\nfastapi-infra = infra.cli:main\n"
+    if entry == "fastapi_infra.egg-info/requires.txt":
+        return _requires_txt_content()
+    if entry == "fastapi_infra.egg-info/SOURCES.txt":
+        return _sources_txt_content(entries)
+    if entry == "fastapi_infra.egg-info/top_level.txt":
+        return "infra\n"
+    return ""
+
+
+def _write_sdist_source(source: Path, content: str | bytes) -> None:
+    if isinstance(content, bytes):
+        source.write_bytes(content)
+    else:
+        source.write_text(content, encoding="utf-8")
 
 
 def test_generated_project_smoke_script_writes_safe_ci_env(tmp_path) -> None:
@@ -951,6 +6541,19 @@ def test_generated_project_smoke_script_uses_generated_makefile(tmp_path, monkey
     module = _load_script("scripts/smoke_generated_projects.py")
     project_dir = tmp_path / "api_app"
     project_dir.mkdir()
+    (project_dir / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[project]",
+                'dependencies = ["fastapi-infra[http]", "uvicorn[standard]>=0.29"]',
+                "",
+                "[project.optional-dependencies]",
+                'dev = ["pytest>=8.0.0", "httpx>=0.27.0,<0.29.0"]',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     commands = []
     env_overlays = []
 
@@ -972,6 +6575,20 @@ def test_generated_project_smoke_script_uses_generated_makefile(tmp_path, monkey
     )
 
     assert commands == [
+        (
+            [
+                "python",
+                "-m",
+                "pip",
+                "install",
+                "fastapi-infra[http]",
+                "uvicorn[standard]>=0.29",
+                "pytest>=8.0.0",
+                "httpx>=0.27.0,<0.29.0",
+            ],
+            project_dir,
+            7,
+        ),
         (["make", "env"], project_dir, 7),
         (["make", "verify"], project_dir, 7),
         (["make", "release-static"], project_dir, 7),
@@ -1062,6 +6679,21 @@ def test_generated_project_smoke_script_private_target_includes_editable_pth_pat
             "existing-path",
         ]
     )
+
+
+def test_smoke_support_keeps_virtualenv_python_bin_on_path(tmp_path, monkeypatch) -> None:
+    module = _load_script("scripts/smoke_support.py")
+    fake_python = tmp_path / "venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    monkeypatch.setattr(module.sys, "executable", str(fake_python))
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    env = module._subprocess_env({"PATH": "base-path"})
+
+    assert env["PATH"].split(os.pathsep)[:2] == [
+        str(tmp_path / "fastapi-infra-smoke-bin"),
+        str(fake_python.parent),
+    ]
 
 
 def test_generated_project_smoke_script_has_external_plugin_mode() -> None:

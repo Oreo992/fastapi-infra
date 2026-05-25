@@ -4,7 +4,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from infra.plugins.tasks.models import TaskEnvelope
+from infra.plugins.tasks.models import TaskEnvelope, normalize_idempotency_key
 
 
 class RedisStreamTaskQueue:
@@ -38,7 +38,7 @@ class RedisStreamTaskQueue:
         delay_seconds: float = 0,
         max_attempts: int = 1,
     ) -> TaskEnvelope:
-        normalized_key = _normalize_idempotency_key(idempotency_key)
+        normalized_key = normalize_idempotency_key(idempotency_key)
         if normalized_key is not None:
             existing_id = await self._load_idempotent_task_id(normalized_key)
             if existing_id is not None:
@@ -342,12 +342,3 @@ class RedisStreamTaskQueue:
 
     def _json_loads(self, value: str) -> Any:
         return json.loads(value)
-
-
-def _normalize_idempotency_key(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError("idempotency_key must not be empty")
-    return normalized

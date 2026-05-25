@@ -1,7 +1,7 @@
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from typing import Any, ContextManager, Literal
+from typing import Any, ContextManager, Literal, cast
 
 from pydantic import BaseModel, Field
 
@@ -62,7 +62,7 @@ class PrometheusMetricsBackend:
     def render(self) -> str:
         from prometheus_client import generate_latest
 
-        return generate_latest(self._registry).decode("utf-8")
+        return cast(str, generate_latest(self._registry).decode("utf-8"))
 
 
 class OpenTelemetryTracingBackend:

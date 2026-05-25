@@ -7,6 +7,63 @@ from infra.plugins.builtin import get_builtin_plugins
 from infra.plugins.manager import PluginDependencyError, PluginManager
 
 
+class FakeDatabaseManager:
+    def __init__(self, config):
+        self.config = config
+        self.initialized = False
+        self.closed = False
+
+    async def initialize(self):
+        self.initialized = True
+
+    async def health_check(self):
+        return True
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeCacheDatabaseManager:
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeCacheService:
+    def __init__(self, namespace="", db_manager=None):
+        self.namespace = namespace
+        self._db_manager = db_manager
+
+
+class FakeHttpClient:
+    def __init__(
+        self,
+        base_url="",
+        timeout=30.0,
+        headers=None,
+        instrumentation=None,
+        propagate_trace_headers=True,
+    ):
+        self.base_url = base_url
+        self.timeout = timeout
+        self.headers = headers or {}
+        self.instrumentation = instrumentation
+        self.propagate_trace_headers = propagate_trace_headers
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+def _fake_backend_find_spec(name):
+    if name in {"aiomysql", "redis", "aiohttp", "orjson"}:
+        return object()
+    return importlib.util.find_spec(name)
+
+
 def test_builtin_plugins_include_optional_backend_plugin_names():
     names = [plugin.metadata.name for plugin in get_builtin_plugins()]
 
@@ -33,59 +90,7 @@ async def test_enabled_backend_plugins_register_fake_services(monkeypatch):
     from infra.plugins.database import plugin as database_plugin
     from infra.plugins.http import plugin as http_plugin
 
-    class FakeDatabaseManager:
-        def __init__(self, config):
-            self.config = config
-            self.initialized = False
-            self.closed = False
-
-        async def initialize(self):
-            self.initialized = True
-
-        async def health_check(self):
-            return True
-
-        async def close(self):
-            self.closed = True
-
-    class FakeCacheDatabaseManager:
-        def __init__(self, config=None):
-            self.config = config or {}
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
-    class FakeCacheService:
-        def __init__(self, namespace="", db_manager=None):
-            self.namespace = namespace
-            self._db_manager = db_manager
-
-    class FakeHttpClient:
-        def __init__(
-            self,
-            base_url="",
-            timeout=30.0,
-            headers=None,
-            instrumentation=None,
-            propagate_trace_headers=True,
-        ):
-            self.base_url = base_url
-            self.timeout = timeout
-            self.headers = headers or {}
-            self.instrumentation = instrumentation
-            self.propagate_trace_headers = propagate_trace_headers
-            self.closed = False
-
-        async def close(self):
-            self.closed = True
-
-    def fake_find_spec(name):
-        if name in {"aiomysql", "redis", "aiohttp", "orjson"}:
-            return object()
-        return importlib.util.find_spec(name)
-
-    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.setattr(importlib.util, "find_spec", _fake_backend_find_spec)
     monkeypatch.setattr(
         database_plugin,
         "_load_database_manager",

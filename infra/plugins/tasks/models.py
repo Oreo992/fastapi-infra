@@ -16,3 +16,12 @@ class TaskEnvelope(BaseModel):
     attempts: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=1, ge=1)
     available_at: float = 0
+
+
+def normalize_idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("idempotency_key must not be empty")
+    return normalized

@@ -39,7 +39,7 @@ PROVIDER_EXAMPLES = {
     "ratelimit": "upstash",
     "speech": "deepgram",
     "storage": "r2",
-    "tasks": "sqs",
+    "tasks": "nats",
     "webhook": "github",
 }
 

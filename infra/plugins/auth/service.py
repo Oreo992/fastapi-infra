@@ -205,7 +205,7 @@ class AuthService:
             signing_input.encode("ascii"),
             hashlib.sha256,
         ).digest()
-        return self._b64url_encode(digest)
+        return _b64_encode(digest)
 
     @staticmethod
     def _build_jwt_keyring(
@@ -250,11 +250,7 @@ class AuthService:
     @staticmethod
     def _b64url_json(value: Mapping[str, Any]) -> str:
         data = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        return AuthService._b64url_encode(data)
-
-    @staticmethod
-    def _b64url_encode(data: bytes) -> str:
-        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+        return _b64_encode(data)
 
     @staticmethod
     def _decode_json(encoded: str) -> dict[str, Any]:

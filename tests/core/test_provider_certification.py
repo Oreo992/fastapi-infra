@@ -666,6 +666,7 @@ def test_provider_certification_module_preflight_can_load_env_file(
 
     monkeypatch.delenv("STRIPE_API_KEY", raising=False)
     monkeypatch.delenv("STRIPE_WEBHOOK_SECRET", raising=False)
+    monkeypatch.setattr(provider_certification, "_package_available", lambda package: True)
     env_file = tmp_path / "provider.env"
     env_file.write_text(
         "\n".join(

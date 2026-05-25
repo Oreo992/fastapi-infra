@@ -7,12 +7,17 @@ from infra.core.health import HealthState
 from infra.plugins.contract import PluginContext, PluginMetadata
 from infra.plugins.manager import PluginDependencyError, PluginManager
 from infra.plugins.tasks import (
+    CeleryTaskQueue,
+    KafkaTaskQueue,
     MemoryTaskQueue,
     RedisStreamTaskQueue,
+    SqsTaskQueue,
     TaskQueueBackendRegistry,
     TasksPlugin,
     TaskState,
 )
+from infra.plugins.tasks.adapters._broker import BrokerMessage
+from infra.plugins.tasks.models import TaskEnvelope
 
 
 class FakeRedis:
@@ -238,6 +243,126 @@ class CustomTaskQueue:
 
     def get(self, task_id):
         return self.tasks[task_id]
+
+
+class FakeSqsClient:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, str]] = []
+        self.sent: list[dict[str, object]] = []
+        self.deleted: list[str] = []
+        self.visibility_changes: list[dict[str, object]] = []
+        self.attributes_checked = False
+        self._next_receipt = 1
+
+    def send_message(self, **kwargs):
+        receipt = f"receipt-{self._next_receipt}"
+        self._next_receipt += 1
+        self.sent.append(dict(kwargs))
+        self.messages.append({"Body": str(kwargs["MessageBody"]), "ReceiptHandle": receipt})
+        return {"MessageId": receipt}
+
+    def receive_message(self, **kwargs):
+        if not self.messages:
+            return {}
+        return {"Messages": [self.messages.pop(0)]}
+
+    def delete_message(self, **kwargs):
+        self.deleted.append(str(kwargs["ReceiptHandle"]))
+        return {}
+
+    def change_message_visibility(self, **kwargs):
+        self.visibility_changes.append(dict(kwargs))
+        return {}
+
+    def get_queue_attributes(self, **kwargs):
+        self.attributes_checked = True
+        return {"Attributes": {"QueueArn": "arn:aws:sqs:us-east-1:123:tasks"}}
+
+
+class FakeKafkaMessage:
+    def __init__(self, value: bytes) -> None:
+        self.value = value
+
+
+class FakeKafkaProducer:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, bytes, bytes | None]] = []
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+    async def send_and_wait(self, topic: str, value: bytes, key: bytes | None = None) -> None:
+        self.messages.append((topic, value, key))
+
+
+class FakeKafkaConsumer:
+    def __init__(self, producer: FakeKafkaProducer) -> None:
+        self.producer = producer
+        self.started = False
+        self.stopped = False
+        self.commits = 0
+        self._offset = 0
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+    async def getone(self) -> FakeKafkaMessage:
+        if self._offset >= len(self.producer.messages):
+            raise TimeoutError
+        _topic, value, _key = self.producer.messages[self._offset]
+        self._offset += 1
+        return FakeKafkaMessage(value)
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+class FakeCeleryReceipt:
+    def __init__(self) -> None:
+        self.acked = False
+
+    def ack(self) -> None:
+        self.acked = True
+
+
+class FakeCeleryTransport:
+    def __init__(self) -> None:
+        self.messages: list[BrokerMessage] = []
+        self.published: list[TaskEnvelope] = []
+        self.dead_letters: list[tuple[str, TaskEnvelope]] = []
+        self.health_checked = False
+        self.closed = False
+
+    async def publish(self, task: TaskEnvelope) -> None:
+        receipt = FakeCeleryReceipt()
+        self.published.append(task)
+        self.messages.append(BrokerMessage(task=task, receipt=receipt))
+
+    async def publish_dead_letter(self, task: TaskEnvelope, queue_name: str) -> None:
+        self.dead_letters.append((queue_name, task))
+
+    async def receive(self) -> BrokerMessage | None:
+        if not self.messages:
+            return None
+        return self.messages.pop(0)
+
+    async def ack(self, receipt: FakeCeleryReceipt) -> None:
+        receipt.ack()
+
+    async def health_check(self) -> bool:
+        self.health_checked = True
+        return True
+
+    def close(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -643,6 +768,156 @@ async def test_tasks_plugin_redis_adapter_uses_database_service_client():
     assert queue_task_name(redis, task.id) == "index_document"
 
     await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tasks_plugin_registers_builtin_sqs_backend():
+    sqs = FakeSqsClient()
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "tasks": {
+                    "enabled": True,
+                    "config": {
+                        "default_provider": "sqs",
+                        "providers": {
+                            "sqs": {
+                                "queue_url": "https://sqs.us-east-1.amazonaws.com/123/tasks",
+                                "wait_time_seconds": 1,
+                                "visibility_timeout": 30,
+                            }
+                        },
+                    },
+                }
+            }
+        }
+    )
+    manager = PluginManager(settings=settings, plugins=[TasksPlugin(sqs_client=sqs)])
+
+    await manager.startup()
+
+    service = manager.get("tasks")
+    assert isinstance(service, TaskQueueBackendRegistry)
+    queue = service.provider()
+    assert isinstance(queue, SqsTaskQueue)
+    assert sqs.attributes_checked is True
+    task = await service.enqueue("index_document", {"id": "doc-1"})
+
+    dequeued = await service.dequeue()
+    assert dequeued == task.model_copy(update={"state": "running", "attempts": 1})
+    await service.complete(task.id)
+
+    assert queue.get(task.id).state == "completed"
+    assert sqs.deleted == ["receipt-1"]
+    assert sqs.sent[0]["QueueUrl"] == "https://sqs.us-east-1.amazonaws.com/123/tasks"
+
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tasks_plugin_registers_builtin_kafka_backend():
+    producer = FakeKafkaProducer()
+    consumer = FakeKafkaConsumer(producer)
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "tasks": {
+                    "enabled": True,
+                    "config": {
+                        "default_provider": "kafka",
+                        "providers": {
+                            "kafka": {
+                                "bootstrap_servers": "localhost:9092",
+                                "topic": "tasks",
+                                "group_id": "workers",
+                                "dead_letter_topic": "tasks.dead",
+                            }
+                        },
+                    },
+                }
+            }
+        }
+    )
+    manager = PluginManager(
+        settings=settings,
+        plugins=[TasksPlugin(kafka_producer=producer, kafka_consumer=consumer)],
+    )
+
+    await manager.startup()
+
+    service = manager.get("tasks")
+    assert isinstance(service, TaskQueueBackendRegistry)
+    queue = service.provider()
+    assert isinstance(queue, KafkaTaskQueue)
+    assert producer.started is True
+    assert consumer.started is True
+    task = await service.enqueue("index_document", {"id": "doc-1"})
+
+    dequeued = await service.dequeue()
+    assert dequeued == task.model_copy(update={"state": "running", "attempts": 1})
+    await service.dead_letter(task.id, "no handler")
+
+    assert queue.get(task.id).state == "dead_lettered"
+    assert consumer.commits == 1
+    assert producer.messages[-1][0] == "tasks.dead"
+
+    await manager.shutdown()
+    assert producer.stopped is True
+    assert consumer.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_tasks_plugin_registers_builtin_celery_backend():
+    transport = FakeCeleryTransport()
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "tasks": {
+                    "enabled": True,
+                    "config": {
+                        "default_provider": "celery",
+                        "providers": {
+                            "celery": {
+                                "broker_url": "redis://localhost:6379/0",
+                                "queue_name": "infra.tasks",
+                                "dead_letter_queue_name": "infra.tasks.dead",
+                            }
+                        },
+                    },
+                }
+            }
+        }
+    )
+    manager = PluginManager(
+        settings=settings,
+        plugins=[TasksPlugin(celery_transport=transport)],
+    )
+
+    await manager.startup()
+
+    service = manager.get("tasks")
+    assert isinstance(service, TaskQueueBackendRegistry)
+    queue = service.provider()
+    assert isinstance(queue, CeleryTaskQueue)
+    assert transport.health_checked is True
+    task = await service.enqueue("index_document", {"id": "doc-1"})
+
+    dequeued = await service.dequeue()
+    assert dequeued == task.model_copy(update={"state": "running", "attempts": 1})
+    await service.retry(task.id, "temporary outage", delay_seconds=0)
+
+    assert queue.get(task.id).state == "queued"
+    assert len(transport.published) == 2
+
+    retry_task = await service.dequeue()
+    assert retry_task is not None
+    await service.dead_letter(task.id, "permanent outage")
+
+    assert transport.dead_letters[0][0] == "infra.tasks.dead"
+    assert queue.get(task.id).state == "dead_lettered"
+
+    await manager.shutdown()
+    assert transport.closed is True
 
 
 @pytest.mark.asyncio

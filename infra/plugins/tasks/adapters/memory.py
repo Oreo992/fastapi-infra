@@ -3,7 +3,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import Any
 
-from infra.plugins.tasks.models import TaskEnvelope
+from infra.plugins.tasks.models import TaskEnvelope, normalize_idempotency_key
 
 
 class MemoryTaskQueue:
@@ -24,7 +24,7 @@ class MemoryTaskQueue:
         delay_seconds: float = 0,
         max_attempts: int = 1,
     ) -> TaskEnvelope:
-        normalized_key = _normalize_idempotency_key(idempotency_key)
+        normalized_key = normalize_idempotency_key(idempotency_key)
         if normalized_key is not None:
             existing_id = self._idempotency_keys.get(normalized_key)
             if existing_id is not None:
@@ -91,12 +91,3 @@ class MemoryTaskQueue:
 
     def get(self, task_id: str) -> TaskEnvelope:
         return self._tasks[task_id].model_copy(deep=True)
-
-
-def _normalize_idempotency_key(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError("idempotency_key must not be empty")
-    return normalized

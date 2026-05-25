@@ -265,7 +265,7 @@ fastapi-infra plugins init deepgram providers/deepgram --kind provider --provide
 fastapi-infra plugins init r2 providers/r2 --kind provider --provider-kind storage
 fastapi-infra plugins init twilio providers/twilio --kind provider --provider-kind notifications
 fastapi-infra plugins init github providers/github --kind provider --provider-kind webhook
-fastapi-infra plugins init sqs providers/sqs --kind provider --provider-kind tasks
+fastapi-infra plugins init nats providers/nats --kind provider --provider-kind tasks
 fastapi-infra plugins init upstash providers/upstash --kind provider --provider-kind ratelimit
 cd providers/openrouter
 pip install -e ".[dev]"

@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from infra.plugins.webhooks.models import WebhookEvent
+from infra.plugins.webhooks.models import WebhookEvent, normalize_webhook_provider_name
 from infra.plugins.webhooks.verification import ProviderSignatureVerifier, stripe_signature_verifier
 
 
@@ -29,7 +29,7 @@ class JsonWebhookProvider:
         *,
         verifier: ProviderSignatureVerifier | None = None,
     ) -> None:
-        self.name = _normalize_provider_name(name)
+        self.name = normalize_webhook_provider_name(name)
         self._verifier = verifier
 
     def verify(self, payload: bytes, headers: Mapping[str, str]) -> bool:
@@ -85,10 +85,10 @@ class WebhookProviderRegistry:
         self._providers: dict[str, Any] = {}
 
     def register(self, provider: Any) -> None:
-        self._providers[_normalize_provider_name(provider.name)] = provider
+        self._providers[normalize_webhook_provider_name(provider.name)] = provider
 
     def get(self, name: str) -> Any:
-        provider_name = _normalize_provider_name(name)
+        provider_name = normalize_webhook_provider_name(name)
         provider = self._providers.get(provider_name)
         if provider is None:
             raise LookupError(f"unknown webhook provider: {provider_name}")
@@ -96,10 +96,3 @@ class WebhookProviderRegistry:
 
     def names(self) -> list[str]:
         return sorted(self._providers)
-
-
-def _normalize_provider_name(provider: str) -> str:
-    normalized = provider.strip().lower()
-    if not normalized:
-        raise ValueError("webhook provider must not be empty")
-    return normalized

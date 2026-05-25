@@ -2,6 +2,7 @@ import json
 import re
 import tomllib
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,42 @@ class _BuiltinPluginNames:
 BUILTIN_PLUGIN_NAMES = _BuiltinPluginNames()
 
 
+@dataclass
+class _ScaffoldPlan:
+    files: dict[Path, str]
+    executable_paths: set[Path]
+
+
+@dataclass(frozen=True)
+class _ScaffoldContext:
+    manifest: dict[str, dict[str, object]]
+    plugin_names: tuple[str, ...]
+    requested_plugins: tuple[str, ...]
+    plugins: tuple[str, ...]
+    production_plugins: tuple[str, ...]
+    package_plugins: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _RenderedScaffoldConfig:
+    local_config: str
+    production_config: str
+    production_config_data: dict[str, Any]
+    runtime_env_example: str
+    provider_env_example: str
+
+
+@dataclass(frozen=True)
+class _MainRenderParts:
+    stdlib_import_block: str
+    fastapi_import: str
+    plugin_import_block: str
+    webhooks_lifespan: str
+    fastapi_args: str
+    post_setup_block: str
+    route_block: str
+
+
 def plugin_profiles() -> dict[str, tuple[str, ...]]:
     profiles = dict(PLUGIN_PROFILES)
     profiles["full"] = _builtin_plugin_names()
@@ -163,129 +200,231 @@ def create_project(
     plugin_registry: Iterable[Any] | None = None,
 ) -> list[Path]:
     """Create a small FastAPI project wired to this infrastructure package."""
+    _validate_project_name(project_name)
+    root = Path(destination)
+    _validate_project_destination(root, overwrite=overwrite)
+    plan = _build_scaffold_plan(
+        project_name,
+        enabled_plugins,
+        profile=profile,
+        plugin_registry=plugin_registry,
+    )
+    if overwrite:
+        _remove_stale_optional_files(root, project_name, plan.files)
+    return _write_scaffold_plan(root, plan)
+
+
+def _validate_project_name(project_name: str) -> None:
     if not PROJECT_NAME_RE.fullmatch(project_name):
         raise ValueError(
             "project_name must start with a lowercase letter and contain only "
             "lowercase letters, numbers, underscores, or hyphens"
         )
 
-    root = Path(destination)
+
+def _validate_project_destination(root: Path, *, overwrite: bool) -> None:
     if root.exists() and not root.is_dir():
         raise FileExistsError(f"Destination exists and is not a directory: {root}")
     if root.exists() and any(root.iterdir()) and not overwrite:
         raise FileExistsError(f"Destination exists and is not empty: {root}")
 
+
+def _build_scaffold_plan(
+    project_name: str,
+    enabled_plugins: Iterable[str],
+    *,
+    profile: str,
+    plugin_registry: Iterable[Any] | None,
+) -> _ScaffoldPlan:
+    context = _build_scaffold_context(
+        enabled_plugins,
+        profile=profile,
+        plugin_registry=plugin_registry,
+    )
+    rendered_config = _render_scaffold_config(project_name, context)
+    files = _base_scaffold_files(project_name, profile, context, rendered_config)
+    scaffold_files, executable_paths = _scaffold_files_for_plugins(
+        context.plugins,
+        manifest=context.manifest,
+    )
+    _merge_plugin_scaffold_files(files, scaffold_files)
+    _add_optional_scaffold_files(project_name, files, context)
+    return _ScaffoldPlan(files=files, executable_paths=executable_paths)
+
+
+def _build_scaffold_context(
+    enabled_plugins: Iterable[str],
+    *,
+    profile: str,
+    plugin_registry: Iterable[Any] | None,
+) -> _ScaffoldContext:
     manifest = _plugin_manifest_for(plugin_registry)
     plugin_names = tuple(manifest)
     profile_plugins = plugins_for_profile(profile)
-    plugins = _validate_plugins((*profile_plugins, *tuple(enabled_plugins)), plugin_names)
+    requested_plugins = tuple(enabled_plugins)
+    plugins = _validate_plugins((*profile_plugins, *requested_plugins), plugin_names)
     production_plugins = _production_plugins_for(
         plugins,
         manifest=manifest,
         plugin_names=plugin_names,
     )
-    production_overrides = _production_config_overrides(plugins)
     package_plugins = tuple(dict.fromkeys((*plugins, *production_plugins)))
-    migration_files = {
-        **_app_migration_files_for_plugins(plugins),
-        **_migration_files_for_plugins(
-            production_plugins, manifest=manifest, plugin_names=plugin_names
-        ),
-    }
-    local_config = _render_infra_toml(
-        plugins,
-        "local_config_example",
+    return _ScaffoldContext(
         manifest=manifest,
         plugin_names=plugin_names,
+        requested_plugins=requested_plugins,
+        plugins=plugins,
+        production_plugins=production_plugins,
+        package_plugins=package_plugins,
+    )
+
+
+def _render_scaffold_config(
+    project_name: str,
+    context: _ScaffoldContext,
+) -> _RenderedScaffoldConfig:
+    production_overrides = _production_config_overrides(context.plugins)
+    local_config = _render_infra_toml(
+        context.plugins,
+        "local_config_example",
+        manifest=context.manifest,
+        plugin_names=context.plugin_names,
     )
     production_config = _render_infra_toml(
-        production_plugins,
+        context.production_plugins,
         "production_config_example",
         env_references=True,
         config_overrides=production_overrides,
-        manifest=manifest,
-        plugin_names=plugin_names,
+        manifest=context.manifest,
+        plugin_names=context.plugin_names,
     )
+    production_config_data = tomllib.loads(production_config)
     runtime_env_example = _render_env_example(
         project_name,
-        production_plugins,
-        manifest=manifest,
+        context.production_plugins,
+        manifest=context.manifest,
     )
     provider_env_example = _render_provider_env_example(
-        production_config,
+        production_config_data,
         runtime_env_example,
     )
-    scaffold_files, executable_paths = _scaffold_files_for_plugins(plugins, manifest=manifest)
-    readme_sections = _scaffold_readme_sections_for_plugins(plugins, manifest=manifest)
-    files = {
+    return _RenderedScaffoldConfig(
+        local_config=local_config,
+        production_config=production_config,
+        production_config_data=production_config_data,
+        runtime_env_example=runtime_env_example,
+        provider_env_example=provider_env_example,
+    )
+
+
+def _base_scaffold_files(
+    project_name: str,
+    profile: str,
+    context: _ScaffoldContext,
+    rendered_config: _RenderedScaffoldConfig,
+) -> dict[Path, str]:
+    readme_sections = _scaffold_readme_sections_for_plugins(
+        context.plugins,
+        manifest=context.manifest,
+    )
+    migration_files = {
+        **_app_migration_files_for_plugins(context.plugins),
+        **_migration_files_for_plugins(
+            context.production_plugins,
+            manifest=context.manifest,
+            plugin_names=context.plugin_names,
+        ),
+    }
+    return {
         Path("AGENTS.md"): _render_agents_md(
             project_name,
             profile,
-            plugins,
-            production_plugins,
+            context.plugins,
+            context.production_plugins,
         ),
         Path(".github/workflows/ci.yml"): _render_project_ci_workflow(),
         Path(".dockerignore"): _render_dockerignore(),
         Path(".gitignore"): _render_gitignore(),
-        Path("compose.yaml"): _render_compose_file(production_config),
+        Path("compose.yaml"): _render_compose_file(rendered_config.production_config_data),
         Path("pyproject.toml"): _render_pyproject(
             project_name,
-            package_plugins,
-            manifest=manifest,
+            context.package_plugins,
+            manifest=context.manifest,
         ),
-        Path("app/main.py"): _render_main(project_name, plugins, package_plugins),
+        Path("app/main.py"): _render_main(
+            project_name,
+            context.plugins,
+            context.package_plugins,
+        ),
         Path("app/settings.py"): _render_settings(),
         Path("scripts/verify-release.sh"): _render_verify_release_script(
-            production_plugins,
-            provider_env_required=_provider_env_example_requires_credentials(provider_env_example),
+            context.production_plugins,
+            provider_env_required=_provider_env_example_requires_credentials(
+                rendered_config.provider_env_example
+            ),
         ),
         Path("scripts/prepare-env.sh"): _render_prepare_env_script(),
         Path("tests/test_config.py"): _render_config_test(),
-        Path("tests/test_health.py"): _render_health_test(plugins, manifest=manifest),
-        Path("Dockerfile"): _render_dockerfile(production_plugins),
-        Path("Makefile"): _render_makefile(production_plugins),
+        Path("tests/test_health.py"): _render_health_test(
+            context.plugins,
+            manifest=context.manifest,
+        ),
+        Path("Dockerfile"): _render_dockerfile(context.production_plugins),
+        Path("Makefile"): _render_makefile(context.production_plugins),
         Path("infra.manifest.json"): _render_project_manifest(
             project_name,
             profile,
-            enabled_plugins=plugins,
-            requested_plugins=enabled_plugins,
-            production_plugins=production_plugins,
-            package_plugins=package_plugins,
-            manifest=manifest,
+            enabled_plugins=context.plugins,
+            requested_plugins=context.requested_plugins,
+            production_plugins=context.production_plugins,
+            package_plugins=context.package_plugins,
+            manifest=context.manifest,
         ),
         Path("README.md"): _render_readme(
             project_name,
-            plugins,
-            production_plugins,
+            context.plugins,
+            context.production_plugins,
             scaffold_readme_sections=readme_sections,
         ),
-        Path(".env.example"): runtime_env_example,
-        Path("provider.env.example"): provider_env_example,
-        Path("infra.toml"): local_config,
-        Path("infra.production.example.toml"): production_config,
+        Path(".env.example"): rendered_config.runtime_env_example,
+        Path("provider.env.example"): rendered_config.provider_env_example,
+        Path("infra.toml"): rendered_config.local_config,
+        Path("infra.production.example.toml"): rendered_config.production_config,
         **migration_files,
     }
+
+
+def _merge_plugin_scaffold_files(
+    files: dict[Path, str],
+    scaffold_files: Mapping[Path, str],
+) -> None:
     for relative_path, content in scaffold_files.items():
         if relative_path in files:
             raise ValueError(f"plugin scaffold file conflicts with generated file: {relative_path}")
         files[relative_path] = content
-    if "tasks" in plugins:
-        files[Path("app/worker.py")] = _render_worker(project_name, plugins)
-    if "database" in production_plugins and not migration_files:
+
+
+def _add_optional_scaffold_files(
+    project_name: str,
+    files: dict[Path, str],
+    context: _ScaffoldContext,
+) -> None:
+    if "tasks" in context.plugins:
+        files[Path("app/worker.py")] = _render_worker(project_name, context.plugins)
+    has_migrations = any(path.parts[0] == "migrations" for path in files)
+    if "database" in context.production_plugins and not has_migrations:
         files[Path("migrations/.gitkeep")] = ""
 
-    if overwrite:
-        _remove_stale_optional_files(root, project_name, files)
 
+def _write_scaffold_plan(root: Path, plan: _ScaffoldPlan) -> list[Path]:
     written: list[Path] = []
-    for relative_path, content in files.items():
+    for relative_path, content in plan.files.items():
         path = root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        if path.suffix == ".sh" or relative_path in executable_paths:
+        if path.suffix == ".sh" or relative_path in plan.executable_paths:
             path.chmod(0o755)
         written.append(path)
-
     return written
 
 
@@ -360,139 +499,201 @@ def _render_main(
 ) -> str:
     enabled = set(enabled_plugins)
     runtime_enabled = set(runtime_plugins or enabled)
-    stdlib_imports: list[str] = []
-    fastapi_imports = {"FastAPI"}
-    plugin_service_imports: list[str] = []
-    auth_import = ""
-    ratelimit_import = ""
-    transaction_import = ""
-    notifications_routes = ""
-    auth_routes = ""
-    cache_routes = ""
-    database_routes = ""
-    http_routes = ""
-    ratelimit_routes = ""
-    payment_routes = ""
-    storage_routes = ""
-    tasks_routes = ""
-    observability_import = ""
-    observability_setup = ""
-    webhooks_import = ""
-    webhooks_lifespan = ""
-    fastapi_args = f'title="{project_name}"'
-    if "auth" in enabled:
-        stdlib_imports.append("from typing import Annotated")
-        fastapi_imports.add("Depends")
-        auth_import = "from infra.plugins.auth import Principal, require_principal\n"
-        auth_routes = """
+    parts = _main_render_parts(project_name, enabled, runtime_enabled)
+    return f"""{parts.stdlib_import_block}{parts.fastapi_import}
 
-@app.get("/me")
-async def me(principal: Annotated[Principal, Depends(require_principal)]) -> dict[str, object]:
-    return {
-        "subject": principal.subject,
-        "scopes": sorted(principal.scopes),
-        "roles": sorted(principal.roles),
-    }
-"""
-    if "tasks" in enabled:
-        plugin_service_imports.append("TASKS_SERVICE")
-        tasks_routes = """
-
-@app.post("/tasks/example")
-async def enqueue_example_task() -> dict[str, object]:
-    queue = infra.require(TASKS_SERVICE)
-    task = await queue.enqueue("example.ping", {"source": "api"})
-    return {"id": task.id, "name": task.name, "state": task.state}
-"""
-    if "payment" in enabled:
-        plugin_service_imports.append("PAYMENT_SERVICE")
-        payment_routes = """
-
-@app.post("/payments/example")
-async def create_example_checkout() -> dict[str, object]:
-    payment = infra.require(PAYMENT_SERVICE)
-    checkout = await payment.create_checkout(
-        amount=1999,
-        currency="usd",
-        reference="example-checkout",
-        success_url="https://example.test/success",
-        cancel_url="https://example.test/cancel",
-    )
-    return checkout.model_dump()
-"""
-    if "notifications" in enabled:
-        plugin_service_imports.append("NOTIFICATIONS_SERVICE")
-        notifications_routes = """
-
-@app.post("/notifications/example")
-async def send_example_notification() -> dict[str, object]:
-    notifications = infra.require(NOTIFICATIONS_SERVICE)
-    result = await notifications.send(
-        channel="email",
-        recipient="user@example.test",
-        subject="Hello from fastapi-infra",
-        body="This notification was sent through the configured provider.",
-        metadata={"source": "api"},
-    )
-    return result.model_dump()
-"""
-    if "storage" in enabled:
-        plugin_service_imports.append("STORAGE_SERVICE")
-        storage_routes = """
-
-@app.post("/storage/example")
-async def write_example_object() -> dict[str, object]:
-    storage = infra.require(STORAGE_SERVICE)
-    key = "examples/hello.txt"
-    await storage.put_object(key, b"hello from fastapi-infra", content_type="text/plain")
-    return {"key": key, "exists": await storage.exists(key)}
-
-
-@app.get("/storage/example")
-async def read_example_object() -> dict[str, object]:
-    storage = infra.require(STORAGE_SERVICE)
-    key = "examples/hello.txt"
-    data = await storage.get_object(key)
-    return {"key": key, "content": data.decode("utf-8")}
-"""
-    if "ratelimit" in enabled:
-        fastapi_imports.add("Depends")
-        plugin_service_imports.append("RATELIMIT_SERVICE")
-        ratelimit_import = "from infra.plugins.ratelimit import rate_limit\n"
-        ratelimit_routes = """
-
-@app.get(
-    "/limited",
-    dependencies=[
-        Depends(rate_limit(limit=2, window_seconds=60, service=RATELIMIT_SERVICE))
-    ],
+from infra import InfraSettings, setup_infra
+from infra.middleware import (
+    ErrorHandlingMiddleware,
+    RequestLoggingMiddleware,
+    SecurityHeadersMiddleware,
+    install_error_handlers,
 )
-async def limited() -> dict[str, str]:
-    return {"status": "ok"}
+{parts.plugin_import_block}
+from .settings import build_settings
+
+
+{parts.webhooks_lifespan}
+app = FastAPI({parts.fastapi_args})
+install_error_handlers(app)
+app.add_middleware(ErrorHandlingMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+
+settings: InfraSettings = build_settings()
+infra = setup_infra(app, settings)
+{parts.post_setup_block}
+
+
+@app.get("/health")
+async def health() -> dict[str, object]:
+    return {{
+        name: status.model_dump()
+        for name, status in infra.health.snapshot().items()
+    }}
+{parts.route_block}
 """
-    if "cache" in enabled:
-        plugin_service_imports.append("CACHE_SERVICE")
-        cache_routes = """
-
-@app.post("/cache/example")
-async def write_example_cache_value() -> dict[str, object]:
-    cache = infra.require(CACHE_SERVICE)
-    await cache.set("examples:greeting", {"message": "hello from fastapi-infra"}, ttl=60)
-    return {"key": "examples:greeting", "stored": True}
 
 
-@app.get("/cache/example")
-async def read_example_cache_value() -> dict[str, object]:
-    cache = infra.require(CACHE_SERVICE)
-    value = await cache.get("examples:greeting")
-    return {"key": "examples:greeting", "value": value}
-"""
-    if "database" in enabled:
-        plugin_service_imports.append("DATABASE_SERVICE")
-        transaction_import = (
-            "from infra.plugins.transaction.coordinator import Operation, TransactionCoordinator\n"
+def _main_render_parts(
+    project_name: str,
+    enabled: set[str],
+    runtime_enabled: set[str],
+) -> _MainRenderParts:
+    return _MainRenderParts(
+        stdlib_import_block=_main_stdlib_import_block(enabled, runtime_enabled),
+        fastapi_import=_main_fastapi_import(enabled),
+        plugin_import_block=_main_plugin_import_block(enabled, runtime_enabled),
+        webhooks_lifespan=_main_webhooks_lifespan(runtime_enabled),
+        fastapi_args=_main_fastapi_args(project_name, runtime_enabled),
+        post_setup_block=_main_post_setup_block(enabled),
+        route_block=_main_route_block(enabled),
+    )
+
+
+def _main_stdlib_import_block(enabled: set[str], runtime_enabled: set[str]) -> str:
+    imports: list[str] = []
+    if "auth" in enabled:
+        imports.append("from typing import Annotated")
+    if "webhooks" in runtime_enabled:
+        imports.extend(
+            [
+                "from collections.abc import AsyncIterator",
+                "from contextlib import asynccontextmanager",
+            ]
         )
-        database_routes = """
+    import_block = "\n".join(sorted(set(imports)))
+    return f"{import_block}\n\n" if import_block else ""
+
+
+def _main_fastapi_import(enabled: set[str]) -> str:
+    imports = {"FastAPI"}
+    if "auth" in enabled or "ratelimit" in enabled:
+        imports.add("Depends")
+    return f"from fastapi import {', '.join(sorted(imports))}"
+
+
+def _main_plugin_import_block(enabled: set[str], runtime_enabled: set[str]) -> str:
+    return "".join(
+        (
+            _render_plugin_service_import(_main_plugin_service_imports(enabled, runtime_enabled)),
+            _main_auth_import(enabled),
+            _main_ratelimit_import(enabled),
+            _main_transaction_import(enabled),
+            _main_observability_import(enabled),
+            _main_webhooks_import(runtime_enabled),
+        )
+    )
+
+
+def _main_plugin_service_imports(enabled: set[str], runtime_enabled: set[str]) -> list[str]:
+    service_imports = [
+        service for plugin, service in _MAIN_PLUGIN_SERVICE_IMPORTS.items() if plugin in enabled
+    ]
+    if "webhooks" in runtime_enabled:
+        service_imports.extend(["DATABASE_SERVICE", "WEBHOOKS_SERVICE"])
+    return service_imports
+
+
+_MAIN_PLUGIN_SERVICE_IMPORTS = {
+    "tasks": "TASKS_SERVICE",
+    "payment": "PAYMENT_SERVICE",
+    "notifications": "NOTIFICATIONS_SERVICE",
+    "storage": "STORAGE_SERVICE",
+    "ratelimit": "RATELIMIT_SERVICE",
+    "cache": "CACHE_SERVICE",
+    "database": "DATABASE_SERVICE",
+    "http": "HTTP_SERVICE",
+}
+
+
+def _main_auth_import(enabled: set[str]) -> str:
+    if "auth" not in enabled:
+        return ""
+    return "from infra.plugins.auth import Principal, require_principal\n"
+
+
+def _main_ratelimit_import(enabled: set[str]) -> str:
+    if "ratelimit" not in enabled:
+        return ""
+    return "from infra.plugins.ratelimit import rate_limit\n"
+
+
+def _main_transaction_import(enabled: set[str]) -> str:
+    if "database" not in enabled:
+        return ""
+    return "from infra.plugins.transaction.coordinator import Operation, TransactionCoordinator\n"
+
+
+def _main_observability_import(enabled: set[str]) -> str:
+    if "observability" not in enabled:
+        return ""
+    return (
+        "from infra.plugins.observability import "
+        "install_observability_middleware, install_observability_routes\n"
+    )
+
+
+def _main_webhooks_import(runtime_enabled: set[str]) -> str:
+    if "webhooks" not in runtime_enabled:
+        return ""
+    return "from infra.plugins.webhooks import SqlWebhookStore, install_webhook_routes\n"
+
+
+def _main_webhooks_lifespan(runtime_enabled: set[str]) -> str:
+    if "webhooks" not in runtime_enabled:
+        return ""
+    return """@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    webhooks = infra.get(WEBHOOKS_SERVICE)
+    if webhooks is not None and not getattr(app.state, "webhook_routes_installed", False):
+        database = infra.get(DATABASE_SERVICE)
+        store = SqlWebhookStore(database) if database is not None else None
+        install_webhook_routes(app, webhooks, store=store)
+        app.state.webhook_routes_installed = True
+    yield
+
+"""
+
+
+def _main_fastapi_args(project_name: str, runtime_enabled: set[str]) -> str:
+    if "webhooks" in runtime_enabled:
+        return f'title="{project_name}", lifespan=lifespan'
+    return f'title="{project_name}"'
+
+
+def _main_post_setup_block(enabled: set[str]) -> str:
+    if "observability" not in enabled:
+        return ""
+    return """
+install_observability_middleware(app)
+install_observability_routes(app, infra, prefix="/ops")
+"""
+
+
+def _main_route_block(enabled: set[str]) -> str:
+    database_routes = _render_main_database_routes() if "database" in enabled else ""
+    route_blocks = [
+        block.strip()
+        for block in (
+            _render_main_static_routes(enabled, "auth"),
+            _render_main_static_routes(enabled, "cache"),
+            database_routes,
+            _render_main_static_routes(enabled, "http"),
+            _render_main_static_routes(enabled, "ratelimit"),
+            _render_main_static_routes(enabled, "notifications"),
+            _render_main_static_routes(enabled, "payment"),
+            _render_main_static_routes(enabled, "storage"),
+            _render_main_static_routes(enabled, "tasks"),
+        )
+        if block.strip()
+    ]
+    route_block = "\n\n".join(route_blocks)
+    return f"\n\n{route_block}\n" if route_block else ""
+
+
+def _render_main_database_routes() -> str:
+    return """
 
 @app.post("/database/example")
 async def write_example_document() -> dict[str, object]:
@@ -542,9 +743,41 @@ async def run_example_transaction(fail: bool = False) -> dict[str, object]:
         "audit": await database.get_document("audit", key),
     }
 """
-    if "http" in enabled:
-        plugin_service_imports.append("HTTP_SERVICE")
-        http_routes = """
+
+
+def _render_main_static_routes(enabled_plugins: set[str], plugin: str) -> str:
+    if plugin not in enabled_plugins:
+        return ""
+    return _MAIN_STATIC_ROUTE_SECTIONS[plugin]
+
+
+_MAIN_STATIC_ROUTE_SECTIONS = {
+    "auth": """
+
+@app.get("/me")
+async def me(principal: Annotated[Principal, Depends(require_principal)]) -> dict[str, object]:
+    return {
+        "subject": principal.subject,
+        "scopes": sorted(principal.scopes),
+        "roles": sorted(principal.roles),
+    }
+""",
+    "cache": """
+
+@app.post("/cache/example")
+async def write_example_cache_value() -> dict[str, object]:
+    cache = infra.require(CACHE_SERVICE)
+    await cache.set("examples:greeting", {"message": "hello from fastapi-infra"}, ttl=60)
+    return {"key": "examples:greeting", "stored": True}
+
+
+@app.get("/cache/example")
+async def read_example_cache_value() -> dict[str, object]:
+    cache = infra.require(CACHE_SERVICE)
+    value = await cache.get("examples:greeting")
+    return {"key": "examples:greeting", "value": value}
+""",
+    "http": """
 
 @app.get("/http/example")
 async def call_example_http_service() -> dict[str, object]:
@@ -559,110 +792,72 @@ async def call_example_http_service() -> dict[str, object]:
         "url": response.url,
         "body": response.json(),
     }
-"""
-    if "observability" in enabled:
-        observability_import = (
-            "from infra.plugins.observability import "
-            "install_observability_middleware, install_observability_routes\n"
-        )
-        observability_setup = """
-install_observability_middleware(app)
-install_observability_routes(app, infra, prefix="/ops")
-"""
-    if "webhooks" in runtime_enabled:
-        stdlib_imports.extend(
-            [
-                "from collections.abc import AsyncIterator",
-                "from contextlib import asynccontextmanager",
-            ]
-        )
-        plugin_service_imports.extend(["DATABASE_SERVICE", "WEBHOOKS_SERVICE"])
-        webhooks_import = (
-            "from infra.plugins.webhooks import SqlWebhookStore, install_webhook_routes\n"
-        )
-        fastapi_args = f'title="{project_name}", lifespan=lifespan'
-        webhooks_lifespan = """@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    webhooks = infra.get(WEBHOOKS_SERVICE)
-    if webhooks is not None and not getattr(app.state, "webhook_routes_installed", False):
-        database = infra.get(DATABASE_SERVICE)
-        store = SqlWebhookStore(database) if database is not None else None
-        install_webhook_routes(app, webhooks, store=store)
-        app.state.webhook_routes_installed = True
-    yield
+""",
+    "notifications": """
 
-"""
-    stdlib_import_block = "\n".join(sorted(set(stdlib_imports)))
-    if stdlib_import_block:
-        stdlib_import_block = f"{stdlib_import_block}\n\n"
-    plugin_import_block = "".join(
-        (
-            _render_plugin_service_import(plugin_service_imports),
-            auth_import,
-            ratelimit_import,
-            transaction_import,
-            observability_import,
-            webhooks_import,
-        )
+@app.post("/notifications/example")
+async def send_example_notification() -> dict[str, object]:
+    notifications = infra.require(NOTIFICATIONS_SERVICE)
+    result = await notifications.send(
+        channel="email",
+        recipient="user@example.test",
+        subject="Hello from fastapi-infra",
+        body="This notification was sent through the configured provider.",
+        metadata={"source": "api"},
     )
-    post_setup_blocks = [block.strip() for block in (observability_setup,) if block.strip()]
-    post_setup_block = "\n".join(post_setup_blocks)
-    if post_setup_block:
-        post_setup_block = f"\n{post_setup_block}\n"
-    route_blocks = [
-        block.strip()
-        for block in (
-            auth_routes,
-            cache_routes,
-            database_routes,
-            http_routes,
-            ratelimit_routes,
-            notifications_routes,
-            payment_routes,
-            storage_routes,
-            tasks_routes,
-        )
-        if block.strip()
-    ]
-    route_block = "\n\n".join(route_blocks)
-    if route_block:
-        route_block = f"\n\n{route_block}\n"
+    return result.model_dump()
+""",
+    "payment": """
 
-    fastapi_import = f"from fastapi import {', '.join(sorted(fastapi_imports))}"
+@app.post("/payments/example")
+async def create_example_checkout() -> dict[str, object]:
+    payment = infra.require(PAYMENT_SERVICE)
+    checkout = await payment.create_checkout(
+        amount=1999,
+        currency="usd",
+        reference="example-checkout",
+        success_url="https://example.test/success",
+        cancel_url="https://example.test/cancel",
+    )
+    return checkout.model_dump()
+""",
+    "ratelimit": """
 
-    return f"""{stdlib_import_block}{fastapi_import}
-
-from infra import InfraSettings, setup_infra
-from infra.middleware import (
-    ErrorHandlingMiddleware,
-    RequestLoggingMiddleware,
-    SecurityHeadersMiddleware,
-    install_error_handlers,
+@app.get(
+    "/limited",
+    dependencies=[
+        Depends(rate_limit(limit=2, window_seconds=60, service=RATELIMIT_SERVICE))
+    ],
 )
-{plugin_import_block}
-from .settings import build_settings
+async def limited() -> dict[str, str]:
+    return {"status": "ok"}
+""",
+    "storage": """
+
+@app.post("/storage/example")
+async def write_example_object() -> dict[str, object]:
+    storage = infra.require(STORAGE_SERVICE)
+    key = "examples/hello.txt"
+    await storage.put_object(key, b"hello from fastapi-infra", content_type="text/plain")
+    return {"key": key, "exists": await storage.exists(key)}
 
 
-{webhooks_lifespan}
-app = FastAPI({fastapi_args})
-install_error_handlers(app)
-app.add_middleware(ErrorHandlingMiddleware)
-app.add_middleware(RequestLoggingMiddleware)
-app.add_middleware(SecurityHeadersMiddleware)
+@app.get("/storage/example")
+async def read_example_object() -> dict[str, object]:
+    storage = infra.require(STORAGE_SERVICE)
+    key = "examples/hello.txt"
+    data = await storage.get_object(key)
+    return {"key": key, "content": data.decode("utf-8")}
+""",
+    "tasks": """
 
-settings: InfraSettings = build_settings()
-infra = setup_infra(app, settings)
-{post_setup_block}
-
-
-@app.get("/health")
-async def health() -> dict[str, object]:
-    return {{
-        name: status.model_dump()
-        for name, status in infra.health.snapshot().items()
-    }}
-{route_block}
-"""
+@app.post("/tasks/example")
+async def enqueue_example_task() -> dict[str, object]:
+    queue = infra.require(TASKS_SERVICE)
+    task = await queue.enqueue("example.ping", {"source": "api"})
+    return {"id": task.id, "name": task.name, "state": task.state}
+""",
+}
 
 
 def _render_worker(
@@ -742,307 +937,16 @@ def _render_health_test(
 ) -> str:
     expected_services = _expected_services_for_plugins(enabled_plugins, manifest=manifest)
     enabled = set(enabled_plugins)
-    plugin_service_imports: list[str] = []
-    if "auth" in enabled:
-        plugin_service_imports.append("AUTH_SERVICE")
-    if "cache" in enabled:
-        plugin_service_imports.append("CACHE_SERVICE")
-    if "database" in enabled:
-        plugin_service_imports.append("DATABASE_SERVICE")
-    if "http" in enabled:
-        plugin_service_imports.append("HTTP_SERVICE")
-    if "notifications" in enabled:
-        plugin_service_imports.append("NOTIFICATIONS_SERVICE")
-    if "payment" in enabled:
-        plugin_service_imports.append("PAYMENT_SERVICE")
-    if "ratelimit" in enabled:
-        plugin_service_imports.append("RATELIMIT_SERVICE")
-    if "observability" in enabled:
-        plugin_service_imports.append("OBSERVABILITY_SERVICE")
-    if "tasks" in enabled:
-        plugin_service_imports.append("TASKS_SERVICE")
-    plugin_service_import = _render_plugin_service_import(plugin_service_imports)
-    auth_tests = ""
-    notifications_tests = ""
-    payment_tests = ""
-    cache_tests = ""
-    database_tests = ""
-    http_tests = ""
-    storage_tests = ""
-    tasks_tests = ""
-    if "auth" in enabled:
-        auth_tests = """
-
-def test_auth_me_requires_bearer_token(client: TestClient) -> None:
-    response = client.get("/me")
-
-    assert response.status_code == 401
-
-
-def test_auth_me_accepts_issued_jwt(client: TestClient) -> None:
-    auth = infra.require(AUTH_SERVICE)
-    token = auth.issue_jwt(
-        subject="user-1",
-        scopes={"profile:read"},
-        roles={"user"},
-    )
-
-    response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "subject": "user-1",
-        "scopes": ["profile:read"],
-        "roles": ["user"],
-    }
-"""
-    if "notifications" in enabled:
-        notifications_tests = """
-
-def test_notifications_example_route_sends_message(client: TestClient) -> None:
-    response = client.post("/notifications/example")
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["id"].startswith("ntf_")
-    assert body["channel"] == "email"
-    assert body["recipient"] == "user@example.test"
-    assert body["subject"] == "Hello from fastapi-infra"
-    assert body["metadata"] == {"source": "api"}
-    assert body["status"] == "skipped"
-    assert infra.require(NOTIFICATIONS_SERVICE).get().results[-1].id == body["id"]
-"""
-    if "payment" in enabled:
-        payment_tests = """
-
-def test_payment_example_route_creates_checkout(client: TestClient) -> None:
-    response = client.post("/payments/example")
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["id"].startswith("chk_mock_")
-    assert body["amount"] == 1999
-    assert body["currency"] == "USD"
-    assert body["reference"] == "example-checkout"
-    assert body["status"] == "pending"
-    assert body["url"].startswith("mock://checkout/")
-    status = awaitable_result(infra.require(PAYMENT_SERVICE).get_payment_status(body["id"]))
-    assert status == "pending"
-
-
-def awaitable_result(value):
-    import asyncio
-
-    return asyncio.run(value)
-"""
-    if "cache" in enabled:
-        cache_tests = """
-
-def test_cache_example_routes_write_and_read_value(client: TestClient) -> None:
-    before_write = client.get("/cache/example")
-
-    assert before_write.status_code == 200
-    assert before_write.json() == {"key": "examples:greeting", "value": None}
-
-    write_response = client.post("/cache/example")
-
-    assert write_response.status_code == 200
-    assert write_response.json() == {"key": "examples:greeting", "stored": True}
-
-    read_response = client.get("/cache/example")
-
-    assert read_response.status_code == 200
-    assert read_response.json() == {
-        "key": "examples:greeting",
-        "value": {"message": "hello from fastapi-infra"},
-    }
-    assert infra.require(CACHE_SERVICE) is not None
-"""
-    if "database" in enabled:
-        database_tests = """
-
-def test_database_example_routes_write_and_read_document(client: TestClient) -> None:
-    before_write = client.get("/database/example")
-
-    assert before_write.status_code == 200
-    assert before_write.json() == {"document": None}
-
-    write_response = client.post("/database/example")
-
-    assert write_response.status_code == 200
-    assert write_response.json() == {
-        "collection": "examples",
-        "key": "greeting",
-        "value": {"message": "hello from fastapi-infra"},
-    }
-
-    read_response = client.get("/database/example")
-
-    assert read_response.status_code == 200
-    assert read_response.json() == {
-        "document": {
-            "collection": "examples",
-            "key": "greeting",
-            "value": {"message": "hello from fastapi-infra"},
-        }
-    }
-    assert infra.require(DATABASE_SERVICE) is not None
-
-
-def test_transaction_example_route_reports_success_and_compensation(client: TestClient) -> None:
-    success_response = client.post("/transactions/example")
-
-    assert success_response.status_code == 200
-    assert success_response.json() == {
-        "success": True,
-        "completed_operations": ["create_order", "write_audit_log"],
-        "failed_operation": None,
-        "compensated_operations": [],
-        "order": {
-            "collection": "orders",
-            "key": "success",
-            "value": {"status": "created"},
-        },
-        "audit": {
-            "collection": "audit",
-            "key": "success",
-            "value": {"event": "order_created"},
-        },
-    }
-
-    failure_response = client.post("/transactions/example?fail=true")
-
-    assert failure_response.status_code == 200
-    assert failure_response.json() == {
-        "success": False,
-        "completed_operations": ["create_order"],
-        "failed_operation": "write_audit_log",
-        "compensated_operations": ["create_order"],
-        "order": None,
-        "audit": None,
-    }
-"""
-    if "http" in enabled:
-        http_tests = """
-
-def test_http_example_route_uses_configured_client(client: TestClient) -> None:
-    response = client.get("/http/example")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status_code": 200,
-        "url": "mock://http/example",
-        "body": {
-            "ok": True,
-            "request": {"method": "GET", "url": "mock://http/example"},
-        },
-    }
-    http = infra.require(HTTP_SERVICE)
-    assert http.requests[-1]["headers"] == {"X-Example": "fastapi-infra"}
-"""
-    if "storage" in enabled:
-        storage_tests = """
-
-def test_storage_example_routes_write_and_read_object(client: TestClient) -> None:
-    write_response = client.post("/storage/example")
-
-    assert write_response.status_code == 200
-    assert write_response.json() == {"key": "examples/hello.txt", "exists": True}
-
-    read_response = client.get("/storage/example")
-
-    assert read_response.status_code == 200
-    assert read_response.json() == {
-        "key": "examples/hello.txt",
-        "content": "hello from fastapi-infra",
-    }
-"""
-    if "tasks" in enabled:
-        task_observability_capture = "            return stats, stored"
-        task_observability_assertions = ""
-        task_result_unpack = "stats, task"
-        if "observability" in enabled:
-            task_observability_capture = """            observability = worker_module.infra.require(OBSERVABILITY_SERVICE)
-            counters = dict(observability.counters)
-            timers = {
-                name: list(values)
-                for name, values in observability.timers.items()
-            }
-            return stats, stored, counters, timers"""
-            task_result_unpack = "stats, task, counters, timers"
-            task_observability_assertions = """
-    assert counters["task_worker_tasks_total"] == 1
-    assert counters["task_worker_completed_total"] == 1
-    assert timers["task_worker_task_seconds"]
-"""
-        tasks_tests = """
-
-def test_tasks_example_route_enqueues_task(client: TestClient) -> None:
-    response = client.post("/tasks/example")
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["name"] == "example.ping"
-    assert body["state"] == "queued"
-    task = infra.require(TASKS_SERVICE).get(body["id"])
-    assert task.payload == {"source": "api"}
-
-
-def test_task_worker_processes_example_task_once() -> None:
-    import asyncio
-
-    worker_module = importlib.import_module("app.worker")
-
-    async def scenario():
-        await worker_module.infra.startup()
-        try:
-            queue = worker_module.infra.require(TASKS_SERVICE)
-            task = await queue.enqueue("example.ping", {"source": "worker-test"})
-            worker = worker_module.build_worker()
-            stats = await worker.run(
-                worker_module.TaskWorkerRunConfig(
-                    max_tasks=1,
-                    idle_poll_limit=1,
-                    require_handlers=True,
-                )
-            )
-            stored = queue.get(task.id)
-__TASK_OBSERVABILITY_CAPTURE__
-        finally:
-            await worker_module.infra.shutdown()
-
-    __TASK_RESULT_UNPACK__ = asyncio.run(scenario())
-
-    assert stats.processed == 1
-    assert stats.completed == 1
-    assert stats.retried == 0
-    assert stats.dead_lettered == 0
-    assert task.name == "example.ping"
-    assert task.state == "completed"
-"""
-        tasks_tests = (
-            tasks_tests.replace(
-                "__TASK_OBSERVABILITY_CAPTURE__", task_observability_capture
-            ).replace("__TASK_RESULT_UNPACK__", task_result_unpack)
-            + task_observability_assertions
-        )
-    ratelimit_tests = ""
-    if "ratelimit" in enabled:
-        ratelimit_tests = """
-
-def test_rate_limited_route_blocks_after_limit(client: TestClient) -> None:
-    first = client.get("/limited")
-    second = client.get("/limited")
-    blocked = client.get("/limited")
-
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert blocked.status_code == 429
-    assert blocked.json()["error"]["message"] == "rate limit exceeded"
-    assert blocked.json()["error"]["code"] == "TOO_MANY_REQUESTS"
-    assert blocked.headers["X-RateLimit-Limit"] == "2"
-    assert blocked.headers["Retry-After"] == "60"
-"""
+    plugin_service_import = _render_plugin_service_import(_health_test_service_imports(enabled))
+    auth_tests = _render_static_health_tests(enabled, "auth")
+    notifications_tests = _render_static_health_tests(enabled, "notifications")
+    payment_tests = _render_static_health_tests(enabled, "payment")
+    cache_tests = _render_static_health_tests(enabled, "cache")
+    database_tests = _render_database_health_tests(enabled)
+    http_tests = _render_static_health_tests(enabled, "http")
+    storage_tests = _render_static_health_tests(enabled, "storage")
+    ratelimit_tests = _render_static_health_tests(enabled, "ratelimit")
+    tasks_tests = _render_tasks_health_tests(enabled)
     return f"""import importlib
 from collections.abc import Iterator
 
@@ -1107,6 +1011,304 @@ def test_enabled_plugin_services_are_registered(client: TestClient) -> None:
 {storage_tests}
 {tasks_tests}
 """
+
+
+def _health_test_service_imports(enabled_plugins: set[str]) -> list[str]:
+    service_imports = {
+        "auth": "AUTH_SERVICE",
+        "cache": "CACHE_SERVICE",
+        "database": "DATABASE_SERVICE",
+        "http": "HTTP_SERVICE",
+        "notifications": "NOTIFICATIONS_SERVICE",
+        "payment": "PAYMENT_SERVICE",
+        "ratelimit": "RATELIMIT_SERVICE",
+        "observability": "OBSERVABILITY_SERVICE",
+        "tasks": "TASKS_SERVICE",
+    }
+    return [service for plugin, service in service_imports.items() if plugin in enabled_plugins]
+
+
+def _render_static_health_tests(enabled_plugins: set[str], plugin: str) -> str:
+    if plugin not in enabled_plugins:
+        return ""
+    return _STATIC_HEALTH_TEST_SECTIONS[plugin]
+
+
+_STATIC_HEALTH_TEST_SECTIONS = {
+    "auth": """
+
+def test_auth_me_requires_bearer_token(client: TestClient) -> None:
+    response = client.get("/me")
+
+    assert response.status_code == 401
+
+
+def test_auth_me_accepts_issued_jwt(client: TestClient) -> None:
+    auth = infra.require(AUTH_SERVICE)
+    token = auth.issue_jwt(
+        subject="user-1",
+        scopes={"profile:read"},
+        roles={"user"},
+    )
+
+    response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "subject": "user-1",
+        "scopes": ["profile:read"],
+        "roles": ["user"],
+    }
+""",
+    "cache": """
+
+def test_cache_example_routes_write_and_read_value(client: TestClient) -> None:
+    before_write = client.get("/cache/example")
+
+    assert before_write.status_code == 200
+    assert before_write.json() == {"key": "examples:greeting", "value": None}
+
+    write_response = client.post("/cache/example")
+
+    assert write_response.status_code == 200
+    assert write_response.json() == {"key": "examples:greeting", "stored": True}
+
+    read_response = client.get("/cache/example")
+
+    assert read_response.status_code == 200
+    assert read_response.json() == {
+        "key": "examples:greeting",
+        "value": {"message": "hello from fastapi-infra"},
+    }
+    assert infra.require(CACHE_SERVICE) is not None
+""",
+    "http": """
+
+def test_http_example_route_uses_configured_client(client: TestClient) -> None:
+    response = client.get("/http/example")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status_code": 200,
+        "url": "mock://http/example",
+        "body": {
+            "ok": True,
+            "request": {"method": "GET", "url": "mock://http/example"},
+        },
+    }
+    http = infra.require(HTTP_SERVICE)
+    assert http.requests[-1]["headers"] == {"X-Example": "fastapi-infra"}
+""",
+    "notifications": """
+
+def test_notifications_example_route_sends_message(client: TestClient) -> None:
+    response = client.post("/notifications/example")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"].startswith("ntf_")
+    assert body["channel"] == "email"
+    assert body["recipient"] == "user@example.test"
+    assert body["subject"] == "Hello from fastapi-infra"
+    assert body["metadata"] == {"source": "api"}
+    assert body["status"] == "skipped"
+    assert infra.require(NOTIFICATIONS_SERVICE).get().results[-1].id == body["id"]
+""",
+    "payment": """
+
+def test_payment_example_route_creates_checkout(client: TestClient) -> None:
+    response = client.post("/payments/example")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"].startswith("chk_mock_")
+    assert body["amount"] == 1999
+    assert body["currency"] == "USD"
+    assert body["reference"] == "example-checkout"
+    assert body["status"] == "pending"
+    assert body["url"].startswith("mock://checkout/")
+    status = awaitable_result(infra.require(PAYMENT_SERVICE).get_payment_status(body["id"]))
+    assert status == "pending"
+
+
+def awaitable_result(value):
+    import asyncio
+
+    return asyncio.run(value)
+""",
+    "ratelimit": """
+
+def test_rate_limited_route_blocks_after_limit(client: TestClient) -> None:
+    first = client.get("/limited")
+    second = client.get("/limited")
+    blocked = client.get("/limited")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["message"] == "rate limit exceeded"
+    assert blocked.json()["error"]["code"] == "TOO_MANY_REQUESTS"
+    assert blocked.headers["X-RateLimit-Limit"] == "2"
+    assert blocked.headers["Retry-After"] == "60"
+""",
+    "storage": """
+
+def test_storage_example_routes_write_and_read_object(client: TestClient) -> None:
+    write_response = client.post("/storage/example")
+
+    assert write_response.status_code == 200
+    assert write_response.json() == {"key": "examples/hello.txt", "exists": True}
+
+    read_response = client.get("/storage/example")
+
+    assert read_response.status_code == 200
+    assert read_response.json() == {
+        "key": "examples/hello.txt",
+        "content": "hello from fastapi-infra",
+    }
+""",
+}
+
+
+def _render_database_health_tests(enabled_plugins: set[str]) -> str:
+    if "database" not in enabled_plugins:
+        return ""
+    return """
+
+def test_database_example_routes_write_and_read_document(client: TestClient) -> None:
+    before_write = client.get("/database/example")
+
+    assert before_write.status_code == 200
+    assert before_write.json() == {"document": None}
+
+    write_response = client.post("/database/example")
+
+    assert write_response.status_code == 200
+    assert write_response.json() == {
+        "collection": "examples",
+        "key": "greeting",
+        "value": {"message": "hello from fastapi-infra"},
+    }
+
+    read_response = client.get("/database/example")
+
+    assert read_response.status_code == 200
+    assert read_response.json() == {
+        "document": {
+            "collection": "examples",
+            "key": "greeting",
+            "value": {"message": "hello from fastapi-infra"},
+        }
+    }
+    assert infra.require(DATABASE_SERVICE) is not None
+
+
+def test_transaction_example_route_reports_success_and_compensation(client: TestClient) -> None:
+    success_response = client.post("/transactions/example")
+
+    assert success_response.status_code == 200
+    assert success_response.json() == {
+        "success": True,
+        "completed_operations": ["create_order", "write_audit_log"],
+        "failed_operation": None,
+        "compensated_operations": [],
+        "order": {
+            "collection": "orders",
+            "key": "success",
+            "value": {"status": "created"},
+        },
+        "audit": {
+            "collection": "audit",
+            "key": "success",
+            "value": {"event": "order_created"},
+        },
+    }
+
+    failure_response = client.post("/transactions/example?fail=true")
+
+    assert failure_response.status_code == 200
+    assert failure_response.json() == {
+        "success": False,
+        "completed_operations": ["create_order"],
+        "failed_operation": "write_audit_log",
+        "compensated_operations": ["create_order"],
+        "order": None,
+        "audit": None,
+    }
+"""
+
+
+def _render_tasks_health_tests(enabled_plugins: set[str]) -> str:
+    if "tasks" not in enabled_plugins:
+        return ""
+    task_observability_capture = "            return stats, stored"
+    task_observability_assertions = ""
+    task_result_unpack = "stats, task"
+    if "observability" in enabled_plugins:
+        task_observability_capture = """            observability = worker_module.infra.require(OBSERVABILITY_SERVICE)
+            counters = dict(observability.counters)
+            timers = {
+                name: list(values)
+                for name, values in observability.timers.items()
+            }
+            return stats, stored, counters, timers"""
+        task_result_unpack = "stats, task, counters, timers"
+        task_observability_assertions = """
+    assert counters["task_worker_tasks_total"] == 1
+    assert counters["task_worker_completed_total"] == 1
+    assert timers["task_worker_task_seconds"]
+"""
+    tasks_tests = """
+
+def test_tasks_example_route_enqueues_task(client: TestClient) -> None:
+    response = client.post("/tasks/example")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "example.ping"
+    assert body["state"] == "queued"
+    task = infra.require(TASKS_SERVICE).get(body["id"])
+    assert task.payload == {"source": "api"}
+
+
+def test_task_worker_processes_example_task_once() -> None:
+    import asyncio
+
+    worker_module = importlib.import_module("app.worker")
+
+    async def scenario():
+        await worker_module.infra.startup()
+        try:
+            queue = worker_module.infra.require(TASKS_SERVICE)
+            task = await queue.enqueue("example.ping", {"source": "worker-test"})
+            worker = worker_module.build_worker()
+            stats = await worker.run(
+                worker_module.TaskWorkerRunConfig(
+                    max_tasks=1,
+                    idle_poll_limit=1,
+                    require_handlers=True,
+                )
+            )
+            stored = queue.get(task.id)
+__TASK_OBSERVABILITY_CAPTURE__
+        finally:
+            await worker_module.infra.shutdown()
+
+    __TASK_RESULT_UNPACK__ = asyncio.run(scenario())
+
+    assert stats.processed == 1
+    assert stats.completed == 1
+    assert stats.retried == 0
+    assert stats.dead_lettered == 0
+    assert task.name == "example.ping"
+    assert task.state == "completed"
+"""
+    return (
+        tasks_tests.replace("__TASK_OBSERVABILITY_CAPTURE__", task_observability_capture).replace(
+            "__TASK_RESULT_UNPACK__", task_result_unpack
+        )
+        + task_observability_assertions
+    )
 
 
 def _expected_services_for_plugins(
@@ -1425,7 +1627,7 @@ provider-preflight.json
 """
 
 
-def _render_compose_file(production_config: str) -> str:
+def _render_compose_file(production_config: Mapping[str, Any]) -> str:
     dependencies = _compose_dependencies_for_production_config(production_config)
     dependency_lines = []
     app_environment = [
@@ -1497,9 +1699,10 @@ def _render_compose_file(production_config: str) -> str:
 {depends_on}{services_block}{volumes_block}"""
 
 
-def _compose_dependencies_for_production_config(production_config: str) -> dict[str, bool]:
-    data = tomllib.loads(production_config)
-    plugins = data.get("infra", {}).get("plugins", {})
+def _compose_dependencies_for_production_config(
+    production_config: Mapping[str, Any],
+) -> dict[str, bool]:
+    plugins = production_config.get("infra", {}).get("plugins", {})
     if not isinstance(plugins, Mapping):
         return {"mysql": False, "redis": False}
     database_plugin = plugins.get("database", {})
@@ -1545,36 +1748,31 @@ def _render_readme(
     plugins = tuple(enabled_plugins)
     production_plugin_tuple = tuple(production_plugins or plugins)
     plugin_list = ", ".join(plugins) or "none"
-    production_plugin_list = ", ".join(production_plugin_tuple) or "none"
     production_migrations_arg = (
         " --migrations migrations" if "database" in production_plugin_tuple else ""
     )
-    production_profile_block = ""
-    if production_plugin_tuple != plugins:
-        production_profile_block = "\nProduction profile plugins: " f"{production_plugin_list}\n"
-    migrations_block = ""
-    if "database" in plugins:
-        migrations_block = """
-## Database migrations
+    production_profile_block = _readme_production_profile_block(
+        plugins,
+        production_plugin_tuple,
+    )
+    migrations_block = _readme_migrations_section(plugins)
+    worker_block = _readme_worker_section(plugins)
+    plugin_sections = _readme_plugin_sections(scaffold_readme_sections)
+    return "".join(
+        (
+            _readme_intro_section(project_name),
+            _readme_local_configuration_section(),
+            _readme_production_check_section(production_migrations_arg),
+            _readme_docker_section(project_name),
+            _readme_configure_section(plugin_list, production_profile_block),
+            migrations_block,
+            worker_block,
+            plugin_sections,
+        )
+    )
 
-```bash
-fastapi-infra migrations new migrations create_users
-fastapi-infra migrations list migrations
-fastapi-infra migrations migrate migrations --settings infra.toml
-```
-"""
-    worker_block = ""
-    if "tasks" in plugins:
-        worker_block = """
-## Worker
 
-```bash
-python -m app.worker
-```
-"""
-    plugin_sections = "\n".join(section.rstrip() for section in scaffold_readme_sections if section)
-    if plugin_sections:
-        plugin_sections = "\n" + plugin_sections + "\n"
+def _readme_intro_section(project_name: str) -> str:
     return f"""# {project_name}
 
 Small FastAPI app generated from `fastapi-infra`.
@@ -1601,7 +1799,11 @@ fastapi-infra config-check --settings infra.toml
 fastapi-infra project-check .
 python -m pytest -q
 ```
+"""
 
+
+def _readme_local_configuration_section() -> str:
+    return """
 ## Local Configuration
 
 `infra.toml` is the local profile. `.env.example` lists runtime variables used by the enabled production providers.
@@ -1612,7 +1814,11 @@ make config-check
 fastapi-infra plugins --settings infra.toml
 fastapi-infra config-check --settings infra.toml
 ```
+"""
 
+
+def _readme_production_check_section(production_migrations_arg: str) -> str:
+    return f"""
 ## Production Check
 
 `infra.production.example.toml` enables production-oriented provider settings. `make env` creates `.env` and `provider.env`; for auth profiles it also replaces the unsafe example `JWT_SECRET` with a generated local secret. Keep live provider certification credentials in `provider.env`.
@@ -1627,7 +1833,11 @@ fastapi-infra release-check --settings infra.production.example.toml --env-file 
 fastapi-infra certify-providers --settings infra.production.example.toml --settings-env-file .env --list --requirements
 fastapi-infra certify-providers --settings infra.production.example.toml --settings-env-file .env --preflight --env-file provider.env
 ```
+"""
 
+
+def _readme_docker_section(project_name: str) -> str:
+    return f"""
 ## Docker
 
 ```bash
@@ -1637,7 +1847,11 @@ docker compose up --build
 docker run --rm -p 8000:8000 {project_name}
 docker run --rm -p 8000:8000 --env-file .env -e INFRA_SETTINGS=infra.production.example.toml {project_name}
 ```
+"""
 
+
+def _readme_configure_section(plugin_list: str, production_profile_block: str) -> str:
+    return f"""
 ## Configure
 
 ```bash
@@ -1650,7 +1864,50 @@ fastapi-infra project-check . --json
 
 Enabled plugins: {plugin_list}
 {production_profile_block}
-{migrations_block}{worker_block}{plugin_sections}"""
+"""
+
+
+def _readme_production_profile_block(
+    enabled_plugins: tuple[str, ...],
+    production_plugins: tuple[str, ...],
+) -> str:
+    if production_plugins == enabled_plugins:
+        return ""
+    production_plugin_list = ", ".join(production_plugins) or "none"
+    return "\nProduction profile plugins: " f"{production_plugin_list}\n"
+
+
+def _readme_migrations_section(enabled_plugins: tuple[str, ...]) -> str:
+    if "database" not in enabled_plugins:
+        return ""
+    return """
+## Database migrations
+
+```bash
+fastapi-infra migrations new migrations create_users
+fastapi-infra migrations list migrations
+fastapi-infra migrations migrate migrations --settings infra.toml
+```
+"""
+
+
+def _readme_worker_section(enabled_plugins: tuple[str, ...]) -> str:
+    if "tasks" not in enabled_plugins:
+        return ""
+    return """
+## Worker
+
+```bash
+python -m app.worker
+```
+"""
+
+
+def _readme_plugin_sections(scaffold_readme_sections: Iterable[str]) -> str:
+    plugin_sections = "\n".join(section.rstrip() for section in scaffold_readme_sections if section)
+    if not plugin_sections:
+        return ""
+    return "\n" + plugin_sections + "\n"
 
 
 def _render_agents_md(
@@ -1843,13 +2100,16 @@ def _render_env_example(
     return "\n".join(lines) + "\n"
 
 
-def _render_provider_env_example(production_config: str, runtime_env_example: str) -> str:
+def _render_provider_env_example(
+    production_config: Mapping[str, Any],
+    runtime_env_example: str,
+) -> str:
     from infra.provider_certification import format_provider_env_template, selected_checks
     from infra.release_check import expected_provider_check_names
 
     runtime_environ = _parse_env_example(runtime_env_example)
     data = _replace_env_references_for_scaffold(
-        tomllib.loads(production_config),
+        production_config,
         runtime_environ,
     )
     settings = InfraSettings(**data)

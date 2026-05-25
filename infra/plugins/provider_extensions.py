@@ -6,7 +6,11 @@ ProviderFactory = Callable[[Mapping[str, Any]], Any]
 
 
 def entry_point_provider_names(group: str) -> set[str]:
-    return {entry_point.name for entry_point in entry_points(group=group)}
+    return set(entry_point_provider_map(group))
+
+
+def entry_point_provider_map(group: str) -> dict[str, Any]:
+    return {entry_point.name: entry_point for entry_point in entry_points(group=group)}
 
 
 def external_provider_names_to_load(
@@ -16,7 +20,7 @@ def external_provider_names_to_load(
     registered_names: set[str],
     entry_point_group: str,
 ) -> list[str]:
-    external_names = entry_point_provider_names(entry_point_group)
+    external_names = set(entry_point_provider_map(entry_point_group))
     unknown_names = requested_names - registered_names - external_names
     if unknown_names:
         raise ValueError(f"unknown {provider_kind} provider: {', '.join(sorted(unknown_names))}")
@@ -30,19 +34,18 @@ def load_entry_point_provider(
     *,
     required_methods: Sequence[str] = (),
 ) -> Any:
-    for entry_point in entry_points(group=group):
-        if entry_point.name != provider_name:
-            continue
-        factory = entry_point.load()
-        if not callable(factory):
-            raise ValueError(f"{group}:{provider_name} must load a provider factory")
-        provider = factory(config)
-        actual_name = getattr(provider, "name", None)
-        if actual_name != provider_name:
-            raise ValueError(f"{group}:{provider_name} returned provider named {actual_name!r}")
-        _validate_provider_methods(group, provider_name, provider, required_methods)
-        return provider
-    raise LookupError(f"unknown provider entry point: {group}:{provider_name}")
+    entry_point = entry_point_provider_map(group).get(provider_name)
+    if entry_point is None:
+        raise LookupError(f"unknown provider entry point: {group}:{provider_name}")
+    factory = entry_point.load()
+    if not callable(factory):
+        raise ValueError(f"{group}:{provider_name} must load a provider factory")
+    provider = factory(config)
+    actual_name = getattr(provider, "name", None)
+    if actual_name != provider_name:
+        raise ValueError(f"{group}:{provider_name} returned provider named {actual_name!r}")
+    _validate_provider_methods(group, provider_name, provider, required_methods)
+    return provider
 
 
 def _validate_provider_methods(

@@ -66,7 +66,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(prog="fastapi-infra")
     subparsers = parser.add_subparsers(dest="command")
+    _add_new_parser(subparsers)
+    _add_migrations_parser(subparsers)
+    _add_certify_providers_parser(subparsers)
+    _add_release_check_parser(subparsers)
+    _add_project_check_parser(subparsers)
+    _add_plugins_parser(subparsers, provider_kinds=tuple(sorted(SUPPORTED_PROVIDER_KINDS)))
+    _add_profiles_parser(subparsers)
+    _add_config_check_parser(subparsers)
+    return parser
 
+
+def _add_new_parser(subparsers) -> None:
     new_parser = subparsers.add_parser("new", help="create a FastAPI project")
     new_parser.add_argument("path", type=Path, help="project destination")
     new_parser.add_argument(
@@ -85,6 +96,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="overwrite generated files in a non-empty destination",
     )
 
+
+def _add_migrations_parser(subparsers) -> None:
     migrations_parser = subparsers.add_parser("migrations", help="manage SQL migrations")
     migration_subparsers = migrations_parser.add_subparsers(dest="migration_command")
 
@@ -107,6 +120,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="JSON or TOML InfraSettings file with the database plugin enabled",
     )
 
+
+def _add_certify_providers_parser(subparsers) -> None:
     certify_parser = subparsers.add_parser(
         "certify-providers",
         help="run opt-in live provider certification checks",
@@ -165,6 +180,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="include required env vars, optional env vars, and packages in --list output",
     )
 
+
+def _add_release_check_parser(subparsers) -> None:
     release_parser = subparsers.add_parser(
         "release-check",
         help="validate production-readiness configuration without starting the app",
@@ -201,6 +218,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="validate enabled plugin schema migrations in this directory",
     )
 
+
+def _add_project_check_parser(subparsers) -> None:
     project_check_parser = subparsers.add_parser(
         "project-check",
         help="audit a generated project manifest against its files and configs",
@@ -216,6 +235,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print a machine-readable generated project audit report",
     )
 
+
+def _add_plugins_parser(subparsers, *, provider_kinds: tuple[str, ...]) -> None:
     plugins_parser = subparsers.add_parser(
         "plugins",
         help="list available plugins and their service/config manifest",
@@ -248,7 +269,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     plugins_parser.add_argument(
         "--provider-kind",
-        choices=tuple(sorted(SUPPORTED_PROVIDER_KINDS)),
+        choices=provider_kinds,
         default="ai",
         help="with 'plugins init --kind provider', choose the provider registry to target",
     )
@@ -264,6 +285,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="plugin names used by 'plugins check'",
     )
 
+
+def _add_profiles_parser(subparsers) -> None:
     profiles_parser = subparsers.add_parser(
         "profiles",
         help="list scaffold plugin profiles",
@@ -274,6 +297,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print machine-readable scaffold profiles",
     )
 
+
+def _add_config_check_parser(subparsers) -> None:
     config_check_parser = subparsers.add_parser(
         "config-check",
         help="validate plugin configuration schemas without starting the app",
@@ -294,8 +319,6 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="load environment variables before resolving settings $env references",
     )
-
-    return parser
 
 
 def _run_new(args: argparse.Namespace) -> int:

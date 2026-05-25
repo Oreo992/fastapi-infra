@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -72,4 +75,29 @@ def run(
     env: dict[str, str] | None = None,
 ) -> None:
     print(f"+ {' '.join(command)}", flush=True)
-    subprocess.run(command, cwd=cwd, check=True, timeout=timeout, env=env)
+    run_env = _subprocess_env(env)
+    subprocess.run(command, cwd=cwd, check=True, timeout=timeout, env=run_env)
+
+
+def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    run_env = dict(os.environ if env is None else env)
+    python_bin = str(Path(sys.executable).parent)
+    shim_bin = _ensure_fastapi_infra_shim()
+    existing_path = run_env.get("PATH")
+    path_entries = [shim_bin, python_bin]
+    if existing_path:
+        path_entries.append(existing_path)
+    run_env["PATH"] = os.pathsep.join(path_entries)
+    return run_env
+
+
+def _ensure_fastapi_infra_shim() -> str:
+    shim_dir = Path(tempfile.gettempdir()) / "fastapi-infra-smoke-bin"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim = shim_dir / "fastapi-infra"
+    shim.write_text(
+        "#!/bin/sh\n" f'exec {shlex.quote(sys.executable)} -m infra.cli "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return str(shim_dir)

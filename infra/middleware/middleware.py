@@ -117,6 +117,57 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        trace_id, request_id, correlation_id = self._bind_request_context(request)
+        start_time = time.time()
+        method = request.method
+        path = str(request.url.path)
+        user_id = self._bind_request_user(request)
+        request_body = await self._request_body_preview(request, method)
+        self._log_request_start(
+            request,
+            method=method,
+            path=path,
+            trace_id=trace_id,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            user_id=user_id,
+            request_body=request_body,
+        )
+
+        try:
+            response = await call_next(request)
+            self._log_request_complete(
+                response,
+                method=method,
+                path=path,
+                start_time=start_time,
+                trace_id=trace_id,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            )
+            _attach_trace_headers(
+                response,
+                trace_id=trace_id,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            )
+            return response
+
+        except Exception as e:
+            self._log_request_error(
+                e,
+                method=method,
+                path=path,
+                start_time=start_time,
+                trace_id=trace_id,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            )
+            raise
+        finally:
+            clear_log_context()
+
+    def _bind_request_context(self, request: Request) -> tuple[str, str, str | None]:
         trace_id = set_trace_id(_incoming_trace_id(request, self.trace_id_header))
         request_id = _incoming_request_id(request, self.request_id_header) or trace_id
         set_request_id(request_id)
@@ -125,31 +176,39 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
         if correlation_id is not None:
             request.state.correlation_id = correlation_id
+        return trace_id, request_id, correlation_id
 
-        # 记录请求开始
-        start_time = time.time()
-        method = request.method
-        path = str(request.url.path)
-
-        # 提取用户ID（如果有）
-        user_id = None
-        if hasattr(request.state, "user_id"):
-            user_id = request.state.user_id
+    def _bind_request_user(self, request: Request) -> Any:
+        user_id = getattr(request.state, "user_id", None)
+        if user_id is not None:
             set_user_id(user_id)
+        return user_id
 
-        # 读取请求体
-        request_body = None
-        if self.include_request_body and method in ["POST", "PUT", "PATCH"]:
-            try:
-                body = await request.body()
-                if body:
-                    request_body = body.decode("utf-8")[: self.max_body_chars]
-                    # 重新设置请求体，因为FastAPI只能读取一次
-                    request._body = body
-            except Exception as e:
-                logger.warning(f"读取请求体失败: {e}")
-                request_body = f"读取失败: {str(e)}"
+    async def _request_body_preview(self, request: Request, method: str) -> str | None:
+        if not self.include_request_body or method not in {"POST", "PUT", "PATCH"}:
+            return None
+        try:
+            body = await request.body()
+            if not body:
+                return None
+            request._body = body
+            return body.decode("utf-8")[: self.max_body_chars]
+        except Exception as e:
+            logger.warning(f"读取请求体失败: {e}")
+            return f"读取失败: {str(e)}"
 
+    def _log_request_start(
+        self,
+        request: Request,
+        *,
+        method: str,
+        path: str,
+        trace_id: str,
+        request_id: str,
+        correlation_id: str | None,
+        user_id: Any,
+        request_body: str | None,
+    ) -> None:
         logger.bind(
             type="request_start",
             method=method,
@@ -163,45 +222,51 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             request_body=request_body,
         ).info(f"请求开始: {method} {path}")
 
-        try:
-            response = await call_next(request)
+    def _log_request_complete(
+        self,
+        response: Response,
+        *,
+        method: str,
+        path: str,
+        start_time: float,
+        trace_id: str,
+        request_id: str,
+        correlation_id: str | None,
+    ) -> None:
+        duration_ms = (time.time() - start_time) * 1000
+        logger.bind(
+            type="request_complete",
+            method=method,
+            path=path,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+            trace_id=trace_id,
+            request_id=request_id,
+            correlation_id=correlation_id,
+        ).info(f"请求完成: {method} {path} {response.status_code} ({duration_ms:.1f}ms)")
 
-            # 记录请求完成
-            duration_ms = (time.time() - start_time) * 1000
-            logger.bind(
-                type="request_complete",
-                method=method,
-                path=path,
-                status_code=response.status_code,
-                duration_ms=duration_ms,
-                trace_id=trace_id,
-                request_id=request_id,
-                correlation_id=correlation_id,
-            ).info(f"请求完成: {method} {path} {response.status_code} ({duration_ms:.1f}ms)")
-
-            _attach_trace_headers(
-                response,
-                trace_id=trace_id,
-                request_id=request_id,
-                correlation_id=correlation_id,
-            )
-            return response
-
-        except Exception as e:
-            duration_ms = (time.time() - start_time) * 1000
-            logger.bind(
-                type="request_error",
-                method=method,
-                path=path,
-                duration_ms=duration_ms,
-                trace_id=trace_id,
-                request_id=request_id,
-                correlation_id=correlation_id,
-                error=str(e),
-            ).error(f"请求失败: {method} {path} ({duration_ms:.1f}ms)")
-            raise
-        finally:
-            clear_log_context()
+    def _log_request_error(
+        self,
+        exc: Exception,
+        *,
+        method: str,
+        path: str,
+        start_time: float,
+        trace_id: str,
+        request_id: str,
+        correlation_id: str | None,
+    ) -> None:
+        duration_ms = (time.time() - start_time) * 1000
+        logger.bind(
+            type="request_error",
+            method=method,
+            path=path,
+            duration_ms=duration_ms,
+            trace_id=trace_id,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            error=str(exc),
+        ).error(f"请求失败: {method} {path} ({duration_ms:.1f}ms)")
 
 
 class ErrorHandlingMiddleware(BaseHTTPMiddleware):

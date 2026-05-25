@@ -395,20 +395,7 @@ class HttpClient:
         if session is None:
             raise HttpError("HTTP session is not initialized")
 
-        # 构建完整URL
-        full_url = self._build_url(url)
-
-        # 合并请求头
-        headers = self.default_headers.copy()
-        if "headers" in kwargs:
-            headers.update(kwargs.pop("headers", {}))
-        if self._propagate_trace_headers:
-            self._attach_trace_headers(headers)
-
-        retry_config = kwargs.pop("retry_config", self.retry_config)
-        timeout = kwargs.pop("timeout", None)
-        if timeout is not None:
-            kwargs["timeout"] = _load_aiohttp().ClientTimeout(total=timeout)
+        full_url, request_kwargs, retry_config = self._prepare_request_kwargs(url, kwargs)
 
         attempt = 0
         self._increment_metric("http_client_requests_total")
@@ -421,44 +408,26 @@ class HttpClient:
             start_time = time.monotonic()
 
             try:
-                with self._span(
-                    "http.client.request",
-                    {
-                        "http.method": method.upper(),
-                        "http.url": full_url,
-                        "http.attempt": attempt,
-                    },
-                ):
-                    async with session.request(
-                        method, full_url, headers=headers, **kwargs
-                    ) as response:
-                        content = await response.read()
-                        text = await response.text()
+                http_response = await self._send_request_attempt(
+                    session,
+                    method,
+                    full_url,
+                    request_kwargs,
+                    attempt=attempt,
+                    start_time=start_time,
+                )
+                if self._should_retry_response(method, http_response, retry_config, attempt):
+                    assert retry_config is not None
+                    self._increment_metric("http_client_retries_total")
+                    logger.warning(
+                        f"HTTP响应将重试: {method} {full_url} "
+                        f"status={http_response.status_code} "
+                        f"attempt={attempt}/{retry_config.max_attempts}"
+                    )
+                    await self._sleep_before_retry(retry_config, attempt)
+                    continue
 
-                        http_response = HttpResponse(
-                            status_code=response.status,
-                            headers=dict(response.headers),
-                            text=text,
-                            content=content,
-                            url=str(response.url),
-                        )
-
-                        self._record_response_metrics(method, response.status, start_time)
-                        logger.debug(f"HTTP响应: {response.status} {len(content)} bytes")
-
-                        if self._should_retry_response(
-                            method, http_response, retry_config, attempt
-                        ):
-                            assert retry_config is not None
-                            self._increment_metric("http_client_retries_total")
-                            logger.warning(
-                                f"HTTP响应将重试: {method} {full_url} status={response.status} "
-                                f"attempt={attempt}/{retry_config.max_attempts}"
-                            )
-                            await self._sleep_before_retry(retry_config, attempt)
-                            continue
-
-                        return http_response
+                return http_response
 
             except TimeoutError as e:
                 self._record_error_metrics(method, start_time)
@@ -489,6 +458,70 @@ class HttpClient:
             except Exception as e:
                 self._record_error_metrics(method, start_time)
                 raise HttpError(f"请求异常: {str(e)}") from e
+
+    async def _send_request_attempt(
+        self,
+        session: Any,
+        method: str,
+        full_url: str,
+        request_kwargs: dict[str, Any],
+        *,
+        attempt: int,
+        start_time: float,
+    ) -> HttpResponse:
+        with self._span(
+            "http.client.request",
+            {
+                "http.method": method.upper(),
+                "http.url": full_url,
+                "http.attempt": attempt,
+            },
+        ):
+            async with session.request(method, full_url, **request_kwargs) as response:
+                content = await response.read()
+                text = await response.text()
+
+                http_response = HttpResponse(
+                    status_code=response.status,
+                    headers=dict(response.headers),
+                    text=text,
+                    content=content,
+                    url=str(response.url),
+                )
+
+                self._record_response_metrics(method, response.status, start_time)
+                logger.debug(f"HTTP响应: {response.status} {len(content)} bytes")
+                return http_response
+
+    def _prepare_request_kwargs(
+        self,
+        url: str,
+        kwargs: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], HttpRetryConfig | None]:
+        full_url = self._build_url(url)
+        request_kwargs = dict(kwargs)
+        request_kwargs["headers"] = self._request_headers(
+            request_kwargs.pop("headers", None),
+            propagate_trace=self._propagate_trace_headers,
+        )
+        retry_config = request_kwargs.pop("retry_config", self.retry_config)
+        timeout = request_kwargs.pop("timeout", None)
+        if timeout is not None:
+            request_kwargs["timeout"] = _load_aiohttp().ClientTimeout(total=timeout)
+        return full_url, request_kwargs, retry_config
+
+    def _request_headers(
+        self,
+        headers: dict[str, str] | None = None,
+        *,
+        propagate_trace: bool,
+    ) -> dict[str, str]:
+        request_headers = self.default_headers.copy()
+        if headers:
+            request_headers.update(headers)
+        if propagate_trace:
+            self._attach_trace_headers(request_headers)
+        return request_headers
 
     def _attach_trace_headers(self, headers: dict[str, str]) -> None:
         trace_id = get_trace_id()
@@ -575,9 +608,7 @@ class HttpClient:
 
         full_url = self._build_url(url)
 
-        request_headers = self.default_headers.copy()
-        if headers:
-            request_headers.update(headers)
+        request_headers = self._request_headers(headers, propagate_trace=False)
 
         try:
             # 计数

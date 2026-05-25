@@ -5,6 +5,8 @@ import importlib.util
 import shutil
 import sys
 import tempfile
+import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence, cast
 
@@ -124,6 +126,7 @@ def _smoke_profile(
             cwd=work_dir,
             timeout=timeout,
         )
+    _install_generated_project_dependencies(project_dir, python=python, timeout=timeout)
     _run(["make", "env"], cwd=project_dir, timeout=timeout)
     _write_ci_env(project_dir / ".env", project_dir / ".env")
     _write_ci_env(
@@ -185,6 +188,7 @@ def _smoke_external_plugin(
             timeout=timeout,
             env=env,
         )
+    _install_generated_project_dependencies(project_dir, python=python, timeout=timeout, env=env)
     _run(["make", "env"], cwd=project_dir, timeout=timeout, env=env)
     _write_ci_env(project_dir / ".env", project_dir / ".env")
     _write_ci_env(
@@ -206,6 +210,41 @@ def _smoke_external_plugin(
         timeout=timeout,
         env=env,
     )
+
+
+def _install_generated_project_dependencies(
+    project_dir: Path,
+    *,
+    python: Path,
+    timeout: float,
+    env: dict[str, str] | None = None,
+) -> None:
+    dependencies = _read_project_dependencies(project_dir / "pyproject.toml")
+    if not dependencies:
+        return
+    command = [str(python), "-m", "pip", "install", *dependencies]
+    if env is None:
+        _run(command, cwd=project_dir, timeout=timeout)
+        return
+    _run(command, cwd=project_dir, timeout=timeout, env=env)
+
+
+def _read_project_dependencies(pyproject_path: Path) -> list[str]:
+    data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    project = data.get("project")
+    if not isinstance(project, Mapping):
+        return []
+    dependencies = _string_list(project.get("dependencies"))
+    optional_dependencies = project.get("optional-dependencies")
+    if isinstance(optional_dependencies, Mapping):
+        dependencies.extend(_string_list(optional_dependencies.get("dev")))
+    return dependencies
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 def _write_ci_env(
