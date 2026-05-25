@@ -126,6 +126,12 @@ class FakeInstrumentation:
         yield
 
 
+class FakeAiohttpModule:
+    class ClientTimeout:
+        def __init__(self, *, total: float) -> None:
+            self.total = total
+
+
 async def test_http_client_request_preserves_per_request_timeout(monkeypatch) -> None:
     client = HttpClient(base_url="https://api.example.test", timeout=30)
     session = FakeAiohttpSession()
@@ -134,6 +140,7 @@ async def test_http_client_request_preserves_per_request_timeout(monkeypatch) ->
         client._session = session
 
     monkeypatch.setattr(client, "_ensure_session", fake_ensure_session)
+    monkeypatch.setattr("infra.http.client._load_aiohttp", lambda: FakeAiohttpModule)
 
     response = await client.get("/items", timeout=2.5)
 

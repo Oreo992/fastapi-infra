@@ -487,7 +487,10 @@ def _missing_required_packages(
 
 def _package_available(package_name: str) -> bool:
     import_name = PACKAGE_IMPORT_NAMES.get(package_name, package_name.replace("-", "_"))
-    return importlib.util.find_spec(import_name) is not None
+    try:
+        return importlib.util.find_spec(import_name) is not None
+    except ModuleNotFoundError:
+        return False
 
 
 def format_provider_certification_report(
