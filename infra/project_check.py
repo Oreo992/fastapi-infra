@@ -298,7 +298,32 @@ def _check_manifest_plugins(
         _error(issues, "manifest_plugins_invalid", "plugins must be a list", "infra.manifest.json")
         return
 
-    plugin_names = []
+    plugin_names = _check_manifest_plugin_entries(
+        plugin_entries,
+        enabled=enabled,
+        production=production,
+        issues=issues,
+    )
+    if tuple(plugin_names) != package:
+        _error(
+            issues,
+            "manifest_plugins_mismatch",
+            "plugin entries are "
+            + _display_list(tuple(plugin_names))
+            + " but package_plugins are "
+            + _display_list(package),
+            "infra.manifest.json",
+        )
+
+
+def _check_manifest_plugin_entries(
+    plugin_entries: list[Any],
+    *,
+    enabled: tuple[str, ...],
+    production: tuple[str, ...],
+    issues: list[ProjectCheckIssue],
+) -> list[str]:
+    plugin_names: list[str] = []
     for index, entry in enumerate(plugin_entries):
         if not isinstance(entry, Mapping):
             _error(
@@ -318,48 +343,65 @@ def _check_manifest_plugins(
             )
             continue
         plugin_names.append(name)
-        requested = entry.get("requested")
-        if requested is not (name in enabled):
-            _error(
-                issues,
-                "manifest_plugin_requested_mismatch",
-                f"plugins[{index}].requested for {name} does not match enabled_plugins",
-                "infra.manifest.json",
-            )
-        production_enabled = entry.get("production_enabled")
-        if production_enabled is not (name in production):
-            _error(
-                issues,
-                "manifest_plugin_production_mismatch",
-                f"plugins[{index}].production_enabled for {name} does not match production_plugins",
-                "infra.manifest.json",
-            )
-        for key in (
-            "services",
-            "env_vars",
-            "recommended_extras",
-            "production_dependencies",
-        ):
-            if not isinstance(entry.get(key, []), list) or not all(
-                isinstance(item, str) for item in entry.get(key, [])
-            ):
-                _error(
-                    issues,
-                    "manifest_plugin_field_invalid",
-                    f"plugins[{index}].{key} must be a list of strings",
-                    "infra.manifest.json",
-                )
+        _check_manifest_plugin_entry_flags(
+            index,
+            entry,
+            name=name,
+            enabled=enabled,
+            production=production,
+            issues=issues,
+        )
+        _check_manifest_plugin_entry_string_lists(index, entry, issues)
+    return plugin_names
 
-    if tuple(plugin_names) != package:
+
+def _check_manifest_plugin_entry_flags(
+    index: int,
+    entry: Mapping[str, Any],
+    *,
+    name: str,
+    enabled: tuple[str, ...],
+    production: tuple[str, ...],
+    issues: list[ProjectCheckIssue],
+) -> None:
+    requested = entry.get("requested")
+    if requested is not (name in enabled):
         _error(
             issues,
-            "manifest_plugins_mismatch",
-            "plugin entries are "
-            + _display_list(tuple(plugin_names))
-            + " but package_plugins are "
-            + _display_list(package),
+            "manifest_plugin_requested_mismatch",
+            f"plugins[{index}].requested for {name} does not match enabled_plugins",
             "infra.manifest.json",
         )
+    production_enabled = entry.get("production_enabled")
+    if production_enabled is not (name in production):
+        _error(
+            issues,
+            "manifest_plugin_production_mismatch",
+            f"plugins[{index}].production_enabled for {name} does not match production_plugins",
+            "infra.manifest.json",
+        )
+
+
+def _check_manifest_plugin_entry_string_lists(
+    index: int,
+    entry: Mapping[str, Any],
+    issues: list[ProjectCheckIssue],
+) -> None:
+    for key in (
+        "services",
+        "env_vars",
+        "recommended_extras",
+        "production_dependencies",
+    ):
+        if not isinstance(entry.get(key, []), list) or not all(
+            isinstance(item, str) for item in entry.get(key, [])
+        ):
+            _error(
+                issues,
+                "manifest_plugin_field_invalid",
+                f"plugins[{index}].{key} must be a list of strings",
+                "infra.manifest.json",
+            )
 
 
 def _check_declared_files(

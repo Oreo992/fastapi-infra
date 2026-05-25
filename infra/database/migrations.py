@@ -12,6 +12,7 @@ from typing import Any, Protocol, TypeAlias, runtime_checkable
 MIGRATION_TABLE = "infra_schema_migrations"
 MIGRATION_FILE_RE = re.compile(r"^(?P<version>[0-9]{14})_(?P<name>[a-z0-9_]+)\.sql$")
 MIGRATION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+SQL_QUOTE_CHARS = {"'", '"', "`"}
 
 
 class MigrationExecutor(Protocol):
@@ -238,47 +239,33 @@ def split_sql_statements(sql: str) -> list[str]:
 
     while index < len(sql):
         char = sql[index]
-        next_char = sql[index + 1] if index + 1 < len(sql) else ""
+        next_char = _next_sql_char(sql, index)
 
         if in_line_comment:
-            if char == "\n":
-                in_line_comment = False
-                buffer.append(char)
-            index += 1
+            index, in_line_comment = _consume_sql_line_comment(sql, index, buffer)
             continue
 
         if in_block_comment:
-            if char == "*" and next_char == "/":
-                in_block_comment = False
-                index += 2
-            else:
-                index += 1
+            index, in_block_comment = _consume_sql_block_comment(sql, index)
             continue
 
-        if quote is None and char == "-" and next_char == "-":
+        if quote is None and _starts_sql_line_comment(char, next_char):
             in_line_comment = True
             index += 2
             continue
-        if quote is None and char == "/" and next_char == "*":
+        if quote is None and _starts_sql_block_comment(char, next_char):
             in_block_comment = True
             index += 2
             continue
 
-        if char in {"'", '"', "`"}:
-            if quote is None:
-                quote = char
-            elif quote == char:
-                escaped = index > 0 and sql[index - 1] == "\\"
-                if not escaped:
-                    quote = None
+        if char in SQL_QUOTE_CHARS:
+            quote = _updated_sql_quote(sql, index, quote)
             buffer.append(char)
             index += 1
             continue
 
         if char == ";" and quote is None:
-            statement = "".join(buffer).strip()
-            if statement:
-                statements.append(statement)
+            _append_sql_statement(statements, buffer)
             buffer.clear()
             index += 1
             continue
@@ -286,7 +273,56 @@ def split_sql_statements(sql: str) -> list[str]:
         buffer.append(char)
         index += 1
 
+    _append_sql_statement(statements, buffer)
+    return statements
+
+
+def _next_sql_char(sql: str, index: int) -> str:
+    return sql[index + 1] if index + 1 < len(sql) else ""
+
+
+def _starts_sql_line_comment(char: str, next_char: str) -> bool:
+    return char == "-" and next_char == "-"
+
+
+def _starts_sql_block_comment(char: str, next_char: str) -> bool:
+    return char == "/" and next_char == "*"
+
+
+def _consume_sql_line_comment(
+    sql: str,
+    index: int,
+    buffer: list[str],
+) -> tuple[int, bool]:
+    char = sql[index]
+    if char == "\n":
+        buffer.append(char)
+        return index + 1, False
+    return index + 1, True
+
+
+def _consume_sql_block_comment(sql: str, index: int) -> tuple[int, bool]:
+    char = sql[index]
+    next_char = _next_sql_char(sql, index)
+    if char == "*" and next_char == "/":
+        return index + 2, False
+    return index + 1, True
+
+
+def _updated_sql_quote(sql: str, index: int, quote: str | None) -> str | None:
+    char = sql[index]
+    if quote is None:
+        return char
+    if quote == char and not _is_escaped_sql_quote(sql, index):
+        return None
+    return quote
+
+
+def _is_escaped_sql_quote(sql: str, index: int) -> bool:
+    return index > 0 and sql[index - 1] == "\\"
+
+
+def _append_sql_statement(statements: list[str], buffer: list[str]) -> None:
     statement = "".join(buffer).strip()
     if statement:
         statements.append(statement)
-    return statements

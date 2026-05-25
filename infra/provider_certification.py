@@ -284,89 +284,83 @@ def evaluate_provider_certification(
     reasons: dict[str, str] | None = None,
 ) -> list[ProviderCertificationResult]:
     reason_map = reasons or {}
-    results: list[ProviderCertificationResult] = []
-    for check in checks:
-        requirements = _result_requirements(check)
-        matched = [
-            (test_name, nodeid, outcome)
-            for nodeid, outcome in outcomes.items()
-            for test_name in check.tests
-            if _nodeid_matches_test(nodeid, test_name)
-        ]
-        if not matched:
-            results.append(
-                ProviderCertificationResult(
-                    name=check.name,
-                    outcome="missing",
-                    tests=check.tests,
-                    details=("no matching test result was collected",),
-                    test_path=check.test_path,
-                    **requirements,
-                )
-            )
-            continue
-        failed = [
-            _detail_with_reason(nodeid, reason_map)
-            for _test_name, nodeid, outcome in matched
-            if outcome == "failed"
-        ]
-        skipped = [
-            _detail_with_reason(nodeid, reason_map)
-            for _test_name, nodeid, outcome in matched
-            if outcome == "skipped"
-        ]
-        passed = [
-            (test_name, nodeid) for test_name, nodeid, outcome in matched if outcome == "passed"
-        ]
+    return [_evaluate_provider_check(check, outcomes, reason_map) for check in checks]
 
-        if failed:
-            results.append(
-                ProviderCertificationResult(
-                    name=check.name,
-                    outcome="failed",
-                    tests=check.tests,
-                    details=tuple(failed),
-                    test_path=check.test_path,
-                    **requirements,
-                )
-            )
-            continue
-        if skipped:
-            results.append(
-                ProviderCertificationResult(
-                    name=check.name,
-                    outcome="skipped",
-                    tests=check.tests,
-                    details=tuple(skipped),
-                    test_path=check.test_path,
-                    **requirements,
-                )
-            )
-            continue
-        passed_test_names = {test_name for test_name, _nodeid in passed}
-        if set(check.tests).issubset(passed_test_names):
-            results.append(
-                ProviderCertificationResult(
-                    name=check.name,
-                    outcome="passed",
-                    tests=check.tests,
-                    details=tuple(nodeid for _test_name, nodeid in passed),
-                    test_path=check.test_path,
-                    **requirements,
-                )
-            )
-            continue
-        results.append(
-            ProviderCertificationResult(
-                name=check.name,
-                outcome="missing",
-                tests=check.tests,
-                details=("not every required test produced a result",),
-                test_path=check.test_path,
-                **requirements,
-            )
+
+def _evaluate_provider_check(
+    check: ProviderCheck,
+    outcomes: dict[str, Outcome],
+    reasons: dict[str, str],
+) -> ProviderCertificationResult:
+    matched = _matched_provider_tests(check, outcomes)
+    if not matched:
+        return _provider_certification_result(
+            check,
+            "missing",
+            ("no matching test result was collected",),
         )
-    return results
+
+    failed = _matched_details(matched, reasons, outcome="failed")
+    if failed:
+        return _provider_certification_result(check, "failed", tuple(failed))
+
+    skipped = _matched_details(matched, reasons, outcome="skipped")
+    if skipped:
+        return _provider_certification_result(check, "skipped", tuple(skipped))
+
+    passed = [(test_name, nodeid) for test_name, nodeid, outcome in matched if outcome == "passed"]
+    passed_test_names = {test_name for test_name, _nodeid in passed}
+    if set(check.tests).issubset(passed_test_names):
+        return _provider_certification_result(
+            check,
+            "passed",
+            tuple(nodeid for _test_name, nodeid in passed),
+        )
+    return _provider_certification_result(
+        check,
+        "missing",
+        ("not every required test produced a result",),
+    )
+
+
+def _matched_provider_tests(
+    check: ProviderCheck,
+    outcomes: dict[str, Outcome],
+) -> list[tuple[str, str, Outcome]]:
+    return [
+        (test_name, nodeid, outcome)
+        for nodeid, outcome in outcomes.items()
+        for test_name in check.tests
+        if _nodeid_matches_test(nodeid, test_name)
+    ]
+
+
+def _matched_details(
+    matched: list[tuple[str, str, Outcome]],
+    reasons: dict[str, str],
+    *,
+    outcome: Outcome,
+) -> list[str]:
+    return [
+        _detail_with_reason(nodeid, reasons)
+        for _test_name, nodeid, matched_outcome in matched
+        if matched_outcome == outcome
+    ]
+
+
+def _provider_certification_result(
+    check: ProviderCheck,
+    outcome: Outcome,
+    details: tuple[str, ...],
+) -> ProviderCertificationResult:
+    return ProviderCertificationResult(
+        name=check.name,
+        outcome=outcome,
+        tests=check.tests,
+        details=details,
+        test_path=check.test_path,
+        **_result_requirements(check),
+    )
 
 
 def _result_requirements(check: ProviderCheck) -> dict[str, tuple[str, ...]]:

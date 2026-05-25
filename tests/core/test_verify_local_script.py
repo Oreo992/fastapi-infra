@@ -62,6 +62,35 @@ def test_verify_local_can_include_package_and_smoke_checks(monkeypatch) -> None:
         (module.sys.executable, "-m", "build", "--outdir", str(package_dist_dir))
     )
 
+    _assert_package_artifact_checks(
+        calls,
+        module=module,
+        build_index=build_index,
+        wheel_path=wheel_path,
+        sdist_path=sdist_path,
+    )
+    _assert_base_wheel_smoke_calls(
+        calls, module=module, build_index=build_index, wheel_path=wheel_path
+    )
+    _assert_dev_wheel_smoke_calls(
+        calls, module=module, build_index=build_index, wheel_path=wheel_path
+    )
+    _assert_observability_smoke_calls(
+        calls,
+        module=module,
+        build_index=build_index,
+        wheel_path=wheel_path,
+    )
+
+
+def _assert_package_artifact_checks(
+    calls: list[tuple[str, ...]],
+    *,
+    module,
+    build_index: int,
+    wheel_path: str,
+    sdist_path: str,
+) -> None:
     assert calls[build_index + 1] == (
         module.sys.executable,
         "-m",
@@ -76,6 +105,15 @@ def test_verify_local_can_include_package_and_smoke_checks(monkeypatch) -> None:
         wheel_path,
         sdist_path,
     )
+
+
+def _assert_base_wheel_smoke_calls(
+    calls: list[tuple[str, ...]],
+    *,
+    module,
+    build_index: int,
+    wheel_path: str,
+) -> None:
     assert calls[build_index + 3] == (
         module.sys.executable,
         "-m",
@@ -100,6 +138,14 @@ def test_verify_local_can_include_package_and_smoke_checks(monkeypatch) -> None:
     )
     assert calls[build_index + 6][:3] == (base_wheel_python, "-c", module.BASE_WHEEL_SMOKE)
 
+
+def _assert_dev_wheel_smoke_calls(
+    calls: list[tuple[str, ...]],
+    *,
+    module,
+    build_index: int,
+    wheel_path: str,
+) -> None:
     assert calls[build_index + 7] == (
         module.sys.executable,
         "-m",
@@ -137,6 +183,15 @@ def test_verify_local_can_include_package_and_smoke_checks(monkeypatch) -> None:
         "--work-dir",
         "/tmp/fastapi-infra-plugin-template-smoke",
     )
+
+
+def _assert_observability_smoke_calls(
+    calls: list[tuple[str, ...]],
+    *,
+    module,
+    build_index: int,
+    wheel_path: str,
+) -> None:
     assert calls[build_index + 12] == (
         module.sys.executable,
         "-m",

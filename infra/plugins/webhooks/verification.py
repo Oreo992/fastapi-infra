@@ -1,5 +1,7 @@
 from collections.abc import Callable, Mapping
 
+from infra.plugins.webhooks.models import normalize_webhook_provider_name
+
 ProviderSignatureVerifier = Callable[[bytes, Mapping[str, str]], bool]
 
 
@@ -21,14 +23,14 @@ class WebhookSignatureVerifierRegistry:
         provider: str,
         verifier: ProviderSignatureVerifier,
     ) -> ProviderSignatureVerifier:
-        provider_name = _normalize_provider(provider)
+        provider_name = normalize_webhook_provider_name(provider)
         if not callable(verifier):
             raise TypeError("webhook signature verifier must be callable")
         self._verifiers[provider_name] = verifier
         return verifier
 
     def verify(self, provider: str, payload: bytes, headers: Mapping[str, str]) -> bool:
-        verifier = self._verifiers.get(_normalize_provider(provider))
+        verifier = self._verifiers.get(normalize_webhook_provider_name(provider))
         if verifier is None:
             return False
         return verifier(payload, headers)
@@ -64,10 +66,3 @@ def build_signature_verifier_registry(
     if isinstance(verifiers, WebhookSignatureVerifierRegistry):
         return verifiers
     return WebhookSignatureVerifierRegistry(verifiers)
-
-
-def _normalize_provider(provider: str) -> str:
-    normalized = provider.strip().lower()
-    if not normalized:
-        raise ValueError("webhook provider must not be empty")
-    return normalized

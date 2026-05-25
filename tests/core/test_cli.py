@@ -886,13 +886,13 @@ def test_plugins_init_can_create_webhook_provider_package(tmp_path, capsys):
 
 
 def test_plugins_init_can_create_tasks_provider_package(tmp_path, capsys):
-    destination = tmp_path / "sqs_provider"
+    destination = tmp_path / "nats_provider"
 
     result = main(
         [
             "plugins",
             "init",
-            "sqs",
+            "nats",
             str(destination),
             "--kind",
             "provider",
@@ -905,25 +905,28 @@ def test_plugins_init_can_create_tasks_provider_package(tmp_path, capsys):
     assert result == 0
     assert "Created provider template" in captured.out
     assert "fastapi-infra config-check --settings infra.example.toml" in captured.out
-    assert "fastapi-infra new /tmp/sqs-api --plugins tasks" in captured.out
+    assert "fastapi-infra new /tmp/nats-api --plugins tasks" in captured.out
     assert captured.err == ""
 
     pyproject = read(destination / "pyproject.toml")
-    provider_module = read(destination / "src" / "fastapi_infra_sqs_tasks_provider" / "__init__.py")
-    certification = read(
-        destination / "src" / "fastapi_infra_sqs_tasks_provider" / "certification.py"
+    provider_module = read(
+        destination / "src" / "fastapi_infra_nats_tasks_provider" / "__init__.py"
     )
-    assert 'name = "fastapi-infra-sqs-tasks-provider"' in pyproject
-    assert 'sqs = "fastapi_infra_sqs_tasks_provider:create_provider"' in pyproject
+    certification = read(
+        destination / "src" / "fastapi_infra_nats_tasks_provider" / "certification.py"
+    )
+    assert 'name = "fastapi-infra-nats-tasks-provider"' in pyproject
+    assert 'nats = "fastapi_infra_nats_tasks_provider:create_provider"' in pyproject
     assert (
-        'sqs_tasks = "fastapi_infra_sqs_tasks_provider.certification:provider_checks"' in pyproject
+        'nats_tasks = "fastapi_infra_nats_tasks_provider.certification:provider_checks"'
+        in pyproject
     )
     assert '[project.entry-points."fastapi_infra.task_queue_backends"]' in pyproject
-    assert 'name = "sqs"' in provider_module
-    assert 'queue_name: str = Field(default="sqs-default", min_length=1)' in provider_module
+    assert 'name = "nats"' in provider_module
+    assert 'queue_name: str = Field(default="nats-default", min_length=1)' in provider_module
     assert 'provider_kind="tasks"' in certification
-    assert 'provider_name="sqs"' in certification
-    assert 'default_provider = "sqs"' in read(destination / "infra.example.toml")
+    assert 'provider_name="nats"' in certification
+    assert 'default_provider = "nats"' in read(destination / "infra.example.toml")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(destination / "src") + os.pathsep + env.get("PYTHONPATH", "")

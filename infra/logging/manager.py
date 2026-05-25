@@ -61,6 +61,21 @@ def _make_rotation_check(max_bytes: int = 100 * 1024 * 1024):
     return check
 
 
+class _InterceptHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        frame, depth = sys._getframe(6), 6
+        while frame and frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+
 class LoggerManager:
     """日志管理器
 
@@ -83,36 +98,44 @@ class LoggerManager:
         logger.configure(patcher=_context_patcher)
 
         log_level = self._config.get("log_level", "INFO")
-        log_format_type = self._config.get("log_format", "pretty")
         environment = self._config.get("environment", "development")
+        is_production = environment == "production"
 
-        if log_format_type == "json":
-            log_format = (
+        self._add_console_handler(
+            log_level=log_level,
+            is_production=is_production,
+        )
+        self._add_file_handlers(log_level=log_level, is_production=is_production)
+        self._install_logging_intercept()
+        self._set_dependency_log_levels()
+
+    def _console_log_format(self, log_level: str) -> str:
+        if self._config.get("log_format", "pretty") == "json":
+            return (
                 "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | "
                 "{extra[trace_id]} | {name}:{function}:{line} | {message}"
             )
-        else:
-            log_format = (
-                "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-                "<level>{level: <8}</level> | "
-                "<yellow>{extra[trace_id]}</yellow> | "
-                "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-                "{message}"
-            )
-            if log_level == "DEBUG":
-                log_format += " | <dim>{extra}</dim>"
+        log_format = (
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<yellow>{extra[trace_id]}</yellow> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+            "{message}"
+        )
+        if log_level == "DEBUG":
+            log_format += " | <dim>{extra}</dim>"
+        return log_format
 
-        # 文件日志格式（无颜色标签）
-        file_log_format = (
+    def _file_log_format(self) -> str:
+        return (
             "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
             "{extra[trace_id]} | {name}:{function}:{line} | {message}"
         )
 
-        # 控制台处理器
-        is_production = environment == "production"
+    def _add_console_handler(self, *, log_level: str, is_production: bool) -> None:
         logger.add(
             sys.stderr,
-            format=log_format,
+            format=self._console_log_format(log_level),
             level=log_level,
             colorize=True,
             enqueue=True,
@@ -120,9 +143,10 @@ class LoggerManager:
             diagnose=not is_production,
         )
 
-        # 文件处理器
+    def _add_file_handlers(self, *, log_level: str, is_production: bool) -> None:
         logs_dir = Path("logs")
         logs_dir.mkdir(exist_ok=True)
+        file_log_format = self._file_log_format()
 
         logger.add(
             logs_dir / "app.log",
@@ -150,27 +174,12 @@ class LoggerManager:
             diagnose=not is_production,
         )
 
-        # 重定向标准logging到loguru
+    def _install_logging_intercept(self) -> None:
         logging.getLogger().handlers.clear()
-
-        class InterceptHandler(logging.Handler):
-            def emit(self, record):
-                try:
-                    level = logger.level(record.levelname).name
-                except ValueError:
-                    level = record.levelno
-
-                frame, depth = sys._getframe(6), 6
-                while frame and frame.f_code.co_filename == logging.__file__:
-                    frame = frame.f_back
-                    depth += 1
-
-                logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
-
-        logging.root.handlers = [InterceptHandler()]
+        logging.root.handlers = [_InterceptHandler()]
         logging.root.setLevel(0)
 
-        # 设置第三方库日志级别
+    def _set_dependency_log_levels(self) -> None:
         logging.getLogger("uvicorn").setLevel(logging.INFO)
         logging.getLogger("aiomysql").setLevel(logging.WARNING)
         logging.getLogger("httpx").setLevel(logging.WARNING)

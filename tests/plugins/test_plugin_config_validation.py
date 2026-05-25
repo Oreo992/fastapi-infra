@@ -22,7 +22,14 @@ from infra.plugins.speech.plugin import SpeechPluginConfig
 from infra.plugins.speech.providers.openai import OpenAISpeechProviderConfig
 from infra.plugins.storage.local import StorageConfig
 from infra.plugins.storage.s3 import S3StorageConfig
-from infra.plugins.tasks.plugin import RedisTaskQueueConfig, TasksPlugin, TasksPluginConfig
+from infra.plugins.tasks.plugin import (
+    CeleryTaskQueueConfig,
+    KafkaTaskQueueConfig,
+    RedisTaskQueueConfig,
+    SqsTaskQueueConfig,
+    TasksPlugin,
+    TasksPluginConfig,
+)
 from infra.plugins.webhooks import WebhooksPluginConfig
 
 
@@ -324,6 +331,16 @@ def test_tasks_config_rejects_invalid_runtime_fields():
             }
         )
         TasksPlugin().validate_config(config)
+    with pytest.raises(ValidationError, match="queue_url"):
+        SqsTaskQueueConfig.model_validate({})
+    with pytest.raises(ValidationError, match="wait_time_seconds"):
+        SqsTaskQueueConfig.model_validate(
+            {"queue_url": "https://sqs.example", "wait_time_seconds": 30}
+        )
+    with pytest.raises(ValidationError, match="topic"):
+        KafkaTaskQueueConfig.model_validate({"topic": ""})
+    with pytest.raises(ValidationError, match="broker_url"):
+        CeleryTaskQueueConfig.model_validate({})
 
 
 def test_ratelimit_config_rejects_invalid_runtime_fields():

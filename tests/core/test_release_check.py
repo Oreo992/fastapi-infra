@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from infra.config.models import InfraSettings
 from infra.plugins.auth import hash_api_key
 from infra.plugins.contract import PluginMetadata
@@ -856,98 +858,95 @@ def test_release_check_accepts_strong_auth_credentials():
     assert report["issues"] == []
 
 
+HARDENED_EXTERNAL_PROVIDER_PLUGINS = {
+    "database": {
+        "enabled": True,
+        "config": {
+            "default_provider": "connections",
+            "connect_on_startup": True,
+        },
+    },
+    "auth": {
+        "enabled": True,
+        "config": {"jwt_secret": "production-jwt-secret-at-least-32-chars"},
+    },
+    "ai": {
+        "enabled": True,
+        "config": {
+            "default_provider": "openai",
+            "health_probe": True,
+            "providers": {"openai": {"api_key": "sk-test"}},
+        },
+    },
+    "payment": {
+        "enabled": True,
+        "config": {
+            "default_provider": "stripe",
+            "health_probe": True,
+            "store_service": "database",
+            "providers": {
+                "stripe": {
+                    "api_key": "sk-test",
+                    "webhook_secret": "whsec_test",
+                }
+            },
+        },
+    },
+    "storage": {
+        "enabled": True,
+        "config": {
+            "default_provider": "s3",
+            "health_probe": True,
+            "providers": {
+                "s3": {
+                    "bucket": "bucket",
+                    "region": "us-east-1",
+                    "access_key_id": "key",
+                    "secret_access_key": "secret",
+                }
+            },
+        },
+    },
+    "speech": {
+        "enabled": True,
+        "config": {
+            "default_provider": "openai",
+            "health_probe": True,
+            "providers": {"openai": {"api_key": "sk-test"}},
+        },
+    },
+    "notifications": {
+        "enabled": True,
+        "config": {
+            "default_provider": "smtp",
+            "health_probe": True,
+            "providers": {"smtp": {"host": "smtp.example.com", "sender": "n@example.com"}},
+        },
+    },
+    "tasks": {
+        "enabled": True,
+        "config": {"default_provider": "redis"},
+    },
+    "webhooks": {
+        "enabled": True,
+        "config": {
+            "durable_store": True,
+            "providers": {"stripe": {"webhook_secret": "whsec_test"}},
+            "required_providers": ["stripe"],
+        },
+    },
+    "cache": {
+        "enabled": True,
+        "config": {
+            "default_provider": "redis",
+            "database_config": {"redis_enabled": True},
+        },
+    },
+}
+
+
 def test_release_check_accepts_hardened_external_provider_config():
-    settings = InfraSettings(
-        infra={
-            "plugins": {
-                "database": {
-                    "enabled": True,
-                    "config": {
-                        "default_provider": "connections",
-                        "connect_on_startup": True,
-                    },
-                },
-                "auth": {
-                    "enabled": True,
-                    "config": {"jwt_secret": "production-jwt-secret-at-least-32-chars"},
-                },
-                "ai": {
-                    "enabled": True,
-                    "config": {
-                        "default_provider": "openai",
-                        "health_probe": True,
-                        "providers": {"openai": {"api_key": "sk-test"}},
-                    },
-                },
-                "payment": {
-                    "enabled": True,
-                    "config": {
-                        "default_provider": "stripe",
-                        "health_probe": True,
-                        "store_service": "database",
-                        "providers": {
-                            "stripe": {
-                                "api_key": "sk-test",
-                                "webhook_secret": "whsec_test",
-                            }
-                        },
-                    },
-                },
-                "storage": {
-                    "enabled": True,
-                    "config": {
-                        "default_provider": "s3",
-                        "health_probe": True,
-                        "providers": {
-                            "s3": {
-                                "bucket": "bucket",
-                                "region": "us-east-1",
-                                "access_key_id": "key",
-                                "secret_access_key": "secret",
-                            }
-                        },
-                    },
-                },
-                "speech": {
-                    "enabled": True,
-                    "config": {
-                        "default_provider": "openai",
-                        "health_probe": True,
-                        "providers": {"openai": {"api_key": "sk-test"}},
-                    },
-                },
-                "notifications": {
-                    "enabled": True,
-                    "config": {
-                        "default_provider": "smtp",
-                        "health_probe": True,
-                        "providers": {
-                            "smtp": {"host": "smtp.example.com", "sender": "n@example.com"}
-                        },
-                    },
-                },
-                "tasks": {
-                    "enabled": True,
-                    "config": {"default_provider": "redis"},
-                },
-                "webhooks": {
-                    "enabled": True,
-                    "config": {
-                        "durable_store": True,
-                        "providers": {"stripe": {"webhook_secret": "whsec_test"}},
-                        "required_providers": ["stripe"],
-                    },
-                },
-                "cache": {
-                    "enabled": True,
-                    "config": {
-                        "default_provider": "redis",
-                        "database_config": {"redis_enabled": True},
-                    },
-                },
-            }
-        }
-    )
+    settings = InfraSettings(infra={"plugins": HARDENED_EXTERNAL_PROVIDER_PLUGINS})
 
     report = build_release_check_report(
         settings,
@@ -2780,6 +2779,42 @@ def test_release_check_requires_redis_certification_for_redis_tasks():
         "code": "certification_missing_provider",
         "message": "provider certification report does not cover: redis",
     } in report["issues"]
+
+
+@pytest.mark.parametrize(
+    "provider_name, provider_config",
+    [
+        ("sqs", {"queue_url": "https://sqs.us-east-1.amazonaws.com/123/tasks"}),
+        (
+            "kafka",
+            {
+                "bootstrap_servers": "localhost:9092",
+                "topic": "tasks",
+                "group_id": "workers",
+            },
+        ),
+        ("celery", {"broker_url": "redis://localhost:6379/0"}),
+    ],
+)
+def test_release_check_accepts_builtin_durable_task_backends(provider_name, provider_config):
+    settings = InfraSettings(
+        infra={
+            "plugins": {
+                "tasks": {
+                    "enabled": True,
+                    "config": {
+                        "default_provider": provider_name,
+                        "providers": {provider_name: provider_config},
+                    },
+                }
+            }
+        }
+    )
+
+    report = build_release_check_report(settings)
+
+    assert report["ready"] is True
+    assert report["issues"] == []
 
 
 def test_release_check_accepts_hardened_webhook_config():

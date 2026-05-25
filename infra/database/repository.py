@@ -328,12 +328,7 @@ class BaseRepository(IRepository[T]):
         order_by = order_by or self.created_at_field
         order_direction = "DESC" if order_desc else "ASC"
 
-        # 构建 WHERE 子句
-        where_clause = ""
-        params = []
-        if self.soft_delete:
-            where_clause = f"WHERE {self.soft_delete_field} = %s"
-            params.append(self.active_value)
+        where_clause, params = self._where_clause()
 
         async with self.get_connection() as conn:
             async with conn.cursor(_dict_cursor()) as cursor:
@@ -383,22 +378,7 @@ class BaseRepository(IRepository[T]):
         order_by = order_by or self.created_at_field
         order_direction = "DESC" if order_desc else "ASC"
 
-        # 构建 WHERE 子句
-        where_parts = []
-        params = []
-
-        for field, value in conditions.items():
-            if value is None:
-                where_parts.append(f"{field} IS NULL")
-            else:
-                where_parts.append(f"{field} = %s")
-                params.append(value)
-
-        if self.soft_delete:
-            where_parts.append(f"{self.soft_delete_field} = %s")
-            params.append(self.active_value)
-
-        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        where_clause, params = self._where_clause(conditions)
 
         async with self.get_connection() as conn:
             async with conn.cursor(_dict_cursor()) as cursor:
@@ -432,8 +412,14 @@ class BaseRepository(IRepository[T]):
         Returns:
             实体数据，不存在返回 None
         """
-        items, _ = await self.find_by(conditions, page=1, page_size=1)
-        return items[0] if items else None
+        where_clause, params = self._where_clause(conditions)
+
+        async with self.get_connection() as conn:
+            async with conn.cursor(_dict_cursor()) as cursor:
+                sql = f"SELECT * FROM {self.table_name} {where_clause} LIMIT 1"
+                await cursor.execute(sql, params if params else None)
+                row = await cursor.fetchone()
+                return self._process_row(dict(row)) if row else None
 
     @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def count(self, conditions: dict[str, Any] | None = None) -> int:
@@ -446,22 +432,7 @@ class BaseRepository(IRepository[T]):
         Returns:
             实体数量
         """
-        where_parts = []
-        params = []
-
-        if conditions:
-            for field, value in conditions.items():
-                if value is None:
-                    where_parts.append(f"{field} IS NULL")
-                else:
-                    where_parts.append(f"{field} = %s")
-                    params.append(value)
-
-        if self.soft_delete:
-            where_parts.append(f"{self.soft_delete_field} = %s")
-            params.append(self.active_value)
-
-        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        where_clause, params = self._where_clause(conditions)
 
         async with self.get_connection() as conn, conn.cursor() as cursor:
             sql = f"SELECT COUNT(*) FROM {self.table_name} {where_clause}"
@@ -480,7 +451,12 @@ class BaseRepository(IRepository[T]):
         Returns:
             是否存在
         """
-        return await self.get_by_id(id) is not None
+        where_clause, params = self._where_clause({self.id_field: id})
+
+        async with self.get_connection() as conn, conn.cursor() as cursor:
+            sql = f"SELECT 1 FROM {self.table_name} {where_clause} LIMIT 1"
+            await cursor.execute(sql, params)
+            return await cursor.fetchone() is not None
 
     @with_resilience(timeout_config=PresetConfigs.DB_TIMEOUT, retry_config=PresetConfigs.DB_RETRY)
     async def get_by_ids(self, ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -517,6 +493,24 @@ class BaseRepository(IRepository[T]):
                 return cast(dict[str, dict[str, Any]], result)
 
     # ==================== 辅助方法 ====================
+
+    def _where_clause(self, conditions: dict[str, Any] | None = None) -> tuple[str, list[Any]]:
+        where_parts = []
+        params = []
+
+        for field, value in (conditions or {}).items():
+            if value is None:
+                where_parts.append(f"{field} IS NULL")
+            else:
+                where_parts.append(f"{field} = %s")
+                params.append(value)
+
+        if self.soft_delete:
+            where_parts.append(f"{self.soft_delete_field} = %s")
+            params.append(self.active_value)
+
+        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        return where_clause, params
 
     def _prepare_insert_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """

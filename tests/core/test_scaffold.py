@@ -90,9 +90,21 @@ class ExternalScaffoldPlugin:
 
 
 def test_create_project_writes_expected_files_and_imports(tmp_path):
-    created = create_project(tmp_path / "service", "billing_api")
+    root = tmp_path / "service"
+    created = create_project(root, "billing_api")
 
-    created_relative = {path.relative_to(tmp_path / "service") for path in created}
+    _assert_minimal_project_file_set(root, created)
+    _assert_minimal_app_main(root)
+    _assert_minimal_project_config_files(root)
+    _assert_minimal_project_runtime_files(root)
+    _assert_minimal_project_scripts(root)
+    _assert_minimal_project_docs(root)
+    _assert_minimal_project_health_tests(root)
+    _assert_minimal_project_manifest(root)
+
+
+def _assert_minimal_project_file_set(root: Path, created: list[Path]) -> None:
+    created_relative = {path.relative_to(root) for path in created}
     assert created_relative == {
         Path("AGENTS.md"),
         Path(".github/workflows/ci.yml"),
@@ -116,7 +128,9 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
         Path("tests/test_health.py"),
     }
 
-    main_py = read(tmp_path / "service" / "app" / "main.py")
+
+def _assert_minimal_app_main(root: Path) -> None:
+    main_py = read(root / "app" / "main.py")
     assert "from fastapi import FastAPI" in main_py
     assert "from infra import InfraSettings, setup_infra" in main_py
     assert "from infra.middleware import (" in main_py
@@ -131,16 +145,27 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
     assert "app.add_middleware(SecurityHeadersMiddleware)" in main_py
     assert "infra.plugins.observability" not in main_py
 
-    settings_py = read(tmp_path / "service" / "app" / "settings.py")
+
+def _assert_minimal_project_config_files(root: Path) -> None:
+    settings_py = read(root / "app" / "settings.py")
     assert "def build_settings() -> InfraSettings:" in settings_py
     assert "INFRA_SETTINGS" in settings_py
     assert "load_infra_settings(config_path)" in settings_py
-    pyproject = read(tmp_path / "service" / "pyproject.toml")
+    pyproject = read(root / "pyproject.toml")
     assert "[project.optional-dependencies]" in pyproject
     assert '"pytest>=8.0.0"' in pyproject
     assert '"httpx>=0.27.0,<0.29.0"' in pyproject
+    config_test = read(root / "tests" / "test_config.py")
+    assert "def test_local_infra_config_loads_and_validates" in config_test
+    assert "def test_local_infra_config_passes_cli_config_check" in config_test
+    assert "def test_production_config_example_passes_cli_config_check" in config_test
+    assert 'str(ROOT / ".env.example")' in config_test
+    assert '"-m",\n            "infra.cli"' in config_test
+    assert "validate_infra_settings(settings, get_available_plugins(settings)) == []" in config_test
 
-    dockerfile = read(tmp_path / "service" / "Dockerfile")
+
+def _assert_minimal_project_runtime_files(root: Path) -> None:
+    dockerfile = read(root / "Dockerfile")
     assert dockerfile.startswith("FROM python:3.11-slim")
     assert "ENV INFRA_SETTINGS=infra.toml" in dockerfile
     assert (
@@ -154,7 +179,7 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
     assert "USER appuser" in dockerfile
     assert "HEALTHCHECK --interval=30s" in dockerfile
     assert "urllib.request.urlopen('http://127.0.0.1:8000/health'" in dockerfile
-    makefile = read(tmp_path / "service" / "Makefile")
+    makefile = read(root / "Makefile")
     assert "install:" in makefile
     assert 'pip install -e ".[dev]"' in makefile
     assert "run:" in makefile
@@ -171,7 +196,7 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
     assert "provider-preflight:" in makefile
     assert "dev-up:" in makefile
     assert "docker compose up --build" in makefile
-    ci_workflow = read(tmp_path / "service" / ".github/workflows/ci.yml")
+    ci_workflow = read(root / ".github/workflows/ci.yml")
     assert 'pip install -e ".[dev]"' in ci_workflow
     assert "make env" in ci_workflow
     assert "make verify" in ci_workflow
@@ -182,13 +207,13 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
     assert "python -m pytest -q" not in ci_workflow
     assert "fastapi-infra release-check --settings infra.production.example.toml" not in ci_workflow
     assert "--migrations migrations --static-only" not in ci_workflow
-    dockerignore = read(tmp_path / "service" / ".dockerignore")
+    dockerignore = read(root / ".dockerignore")
     assert ".env" in dockerignore
     assert "provider.env" in dockerignore
     assert "provider-env-template.env" in dockerignore
     assert "provider-certification.json" in dockerignore
     assert "provider-preflight.json" in dockerignore
-    gitignore = read(tmp_path / "service" / ".gitignore")
+    gitignore = read(root / ".gitignore")
     assert ".env" in gitignore
     assert "provider.env" in gitignore
     assert "provider-env-template.env" in gitignore
@@ -196,7 +221,7 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
     assert "provider-preflight.json" in gitignore
     assert ".coverage" in gitignore
     assert "htmlcov" in gitignore
-    compose = read(tmp_path / "service" / "compose.yaml")
+    compose = read(root / "compose.yaml")
     assert "services:" in compose
     assert "  app:" in compose
     assert "    build: ." in compose
@@ -205,14 +230,10 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
     assert '      - "8000:8000"' in compose
     assert "  mysql:" not in compose
     assert "  redis:" not in compose
-    config_test = read(tmp_path / "service" / "tests" / "test_config.py")
-    assert "def test_local_infra_config_loads_and_validates" in config_test
-    assert "def test_local_infra_config_passes_cli_config_check" in config_test
-    assert "def test_production_config_example_passes_cli_config_check" in config_test
-    assert 'str(ROOT / ".env.example")' in config_test
-    assert '"-m",\n            "infra.cli"' in config_test
-    assert "validate_infra_settings(settings, get_available_plugins(settings)) == []" in config_test
-    verify_script = read(tmp_path / "service" / "scripts" / "verify-release.sh")
+
+
+def _assert_minimal_project_scripts(root: Path) -> None:
+    verify_script = read(root / "scripts" / "verify-release.sh")
     assert verify_script.startswith("#!/usr/bin/env sh")
     assert "make verify" in verify_script
     assert 'RUNTIME_ENV_FILE="$RUNTIME_ENV_FILE" make release-static' in verify_script
@@ -234,17 +255,20 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
     assert "RUN_LIVE_CERTIFICATION" in verify_script
     assert "copy provider.env.example to provider.env" in verify_script
     assert "--migrations migrations --static-only" not in verify_script
-    prepare_env_script = read(tmp_path / "service" / "scripts" / "prepare-env.sh")
+    prepare_env_script = read(root / "scripts" / "prepare-env.sh")
     assert prepare_env_script.startswith("#!/usr/bin/env sh")
     assert "secrets.token_urlsafe(32)" in prepare_env_script
     assert "JWT_SECRET" in prepare_env_script
     assert 'cp .env.example "$RUNTIME_ENV_FILE"' in prepare_env_script
     assert 'cp provider.env.example "$PROVIDER_ENV_FILE"' in prepare_env_script
-    assert (tmp_path / "service" / "scripts" / "verify-release.sh").stat().st_mode & 0o111
-    assert (tmp_path / "service" / "scripts" / "prepare-env.sh").stat().st_mode & 0o111
-    provider_env_example = read(tmp_path / "service" / "provider.env.example")
+    assert (root / "scripts" / "verify-release.sh").stat().st_mode & 0o111
+    assert (root / "scripts" / "prepare-env.sh").stat().st_mode & 0o111
+    provider_env_example = read(root / "provider.env.example")
     assert "No live provider checks are required" in provider_env_example
-    generated_readme = read(tmp_path / "service" / "README.md")
+
+
+def _assert_minimal_project_docs(root: Path) -> None:
+    generated_readme = read(root / "README.md")
     assert "for auth profiles it also replaces the unsafe example `JWT_SECRET`" in generated_readme
     assert "make verify" in generated_readme
     assert "make env" in generated_readme
@@ -261,7 +285,7 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
         "--env-file .env --static-only" in generated_readme
     )
     assert "--migrations migrations --static-only" not in generated_readme
-    agents_md = read(tmp_path / "service" / "AGENTS.md")
+    agents_md = read(root / "AGENTS.md")
     assert agents_md.startswith("# AGENTS.md")
     assert "Project: `billing_api`" in agents_md
     assert "Scaffold profile: `minimal`" in agents_md
@@ -273,20 +297,19 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
     assert "Run `make release-static` for static production readiness." in agents_md
     assert "Keep runtime `.env` separate from provider `provider.env`." in agents_md
     assert "Do not run live provider certification unless explicitly requested." in agents_md
-    assert "def test_health_returns_snapshot" in read(
-        tmp_path / "service" / "tests" / "test_health.py"
-    )
-    assert "def test_health_includes_trace_headers" in read(
-        tmp_path / "service" / "tests" / "test_health.py"
-    )
-    assert "def test_health_includes_security_headers" in read(
-        tmp_path / "service" / "tests" / "test_health.py"
-    )
-    assert "def test_enabled_plugin_services_are_registered" in read(
-        tmp_path / "service" / "tests" / "test_health.py"
-    )
-    assert "EXPECTED_SERVICES = []" in read(tmp_path / "service" / "tests" / "test_health.py")
-    project_manifest = json.loads(read(tmp_path / "service" / "infra.manifest.json"))
+
+
+def _assert_minimal_project_health_tests(root: Path) -> None:
+    health_test = read(root / "tests" / "test_health.py")
+    assert "def test_health_returns_snapshot" in health_test
+    assert "def test_health_includes_trace_headers" in health_test
+    assert "def test_health_includes_security_headers" in health_test
+    assert "def test_enabled_plugin_services_are_registered" in health_test
+    assert "EXPECTED_SERVICES = []" in health_test
+
+
+def _assert_minimal_project_manifest(root: Path) -> None:
+    project_manifest = json.loads(read(root / "infra.manifest.json"))
     assert project_manifest["schema_version"] == 1
     assert project_manifest["generator"] == "fastapi-infra"
     assert project_manifest["project_name"] == "billing_api"
@@ -313,13 +336,19 @@ def test_create_project_writes_expected_files_and_imports(tmp_path):
 
 
 def test_create_project_configures_only_requested_plugins(tmp_path):
-    create_project(
-        tmp_path / "service",
-        "billing_api",
-        enabled_plugins=("auth", "tasks"),
-    )
+    root = tmp_path / "service"
+    create_project(root, "billing_api", enabled_plugins=("auth", "tasks"))
 
-    infra_toml = read(tmp_path / "service" / "infra.toml")
+    _assert_auth_tasks_local_config(root)
+    _assert_auth_tasks_main_py(root)
+    _assert_auth_tasks_release_files(root)
+    _assert_auth_tasks_runtime_files(root)
+    _assert_auth_tasks_manifest(root)
+    _assert_auth_tasks_health_tests(root)
+
+
+def _assert_auth_tasks_local_config(root: Path) -> None:
+    infra_toml = read(root / "infra.toml")
     assert "[infra.plugins.auth]\nenabled = true" in infra_toml
     assert "[infra.plugins.auth.config]\njwt_secret = " in infra_toml
     assert "[infra.plugins.tasks]\nenabled = true" in infra_toml
@@ -327,7 +356,10 @@ def test_create_project_configures_only_requested_plugins(tmp_path):
     assert "[infra.plugins.ai]\nenabled = false" in infra_toml
     assert "[infra.plugins.observability]\nenabled = false" in infra_toml
     assert "[infra.plugins.payment]\nenabled = false" in infra_toml
-    main_py = read(tmp_path / "service" / "app" / "main.py")
+
+
+def _assert_auth_tasks_main_py(root: Path) -> None:
+    main_py = read(root / "app" / "main.py")
     assert "from fastapi import Depends, FastAPI" in main_py
     assert "from infra.plugins import TASKS_SERVICE" in main_py
     assert "STORAGE_SERVICE" not in main_py
@@ -337,7 +369,10 @@ def test_create_project_configures_only_requested_plugins(tmp_path):
     assert '@app.post("/storage/example")' not in main_py
     assert '@app.post("/tasks/example")' in main_py
     assert 'queue.enqueue("example.ping", {"source": "api"})' in main_py
-    generated_readme = read(tmp_path / "service" / "README.md")
+
+
+def _assert_auth_tasks_release_files(root: Path) -> None:
+    generated_readme = read(root / "README.md")
     assert 'pip install -e ".[dev]"' in generated_readme
     assert "scripts/verify-release.sh .env provider.env" in generated_readme
     assert "fastapi-infra config-check --settings infra.toml" in generated_readme
@@ -360,7 +395,7 @@ def test_create_project_configures_only_requested_plugins(tmp_path):
     assert "docker build -t billing_api ." in generated_readme
     assert "INFRA_SETTINGS=infra.production.example.toml" in generated_readme
     assert "python -m pytest -q" in generated_readme
-    verify_script = read(tmp_path / "service" / "scripts" / "verify-release.sh")
+    verify_script = read(root / "scripts" / "verify-release.sh")
     assert "unsafe JWT_SECRET in $RUNTIME_ENV_FILE" in verify_script
     assert "replace it with a random secret of at least 32 characters" in verify_script
     assert 'RUNTIME_ENV_FILE="$RUNTIME_ENV_FILE" make release-static' in verify_script
@@ -373,25 +408,31 @@ def test_create_project_configures_only_requested_plugins(tmp_path):
         '--settings-env-file "$RUNTIME_ENV_FILE" --env-file "$PROVIDER_ENV_FILE" --json '
         "> provider-certification.json" in verify_script
     )
-    ci_workflow = read(tmp_path / "service" / ".github/workflows/ci.yml")
+    ci_workflow = read(root / ".github/workflows/ci.yml")
     assert "make env" in ci_workflow
     assert "make verify" in ci_workflow
     assert "make release-static" in ci_workflow
     assert "fastapi-infra release-check --settings infra.production.example.toml" not in ci_workflow
-    compose = read(tmp_path / "service" / "compose.yaml")
+
+
+def _assert_auth_tasks_runtime_files(root: Path) -> None:
+    compose = read(root / "compose.yaml")
     assert "      REDIS_URL: redis://redis:6379/0" in compose
     assert "  redis:" in compose
     assert '      test: ["CMD", "redis-cli", "ping"]' in compose
     assert "  redis_data:" in compose
     assert "  mysql:" not in compose
-    dockerfile = read(tmp_path / "service" / "Dockerfile")
+    dockerfile = read(root / "Dockerfile")
     assert "COPY migrations ./migrations" in dockerfile
-    makefile = read(tmp_path / "service" / "Makefile")
+    makefile = read(root / "Makefile")
     assert "--migrations migrations --static-only" in makefile
-    provider_env_example = read(tmp_path / "service" / "provider.env.example")
+    provider_env_example = read(root / "provider.env.example")
     assert "REDIS_LIVE_URL=" in provider_env_example
     assert "MYSQL_LIVE_HOST" not in provider_env_example
-    project_manifest = json.loads(read(tmp_path / "service" / "infra.manifest.json"))
+
+
+def _assert_auth_tasks_manifest(root: Path) -> None:
+    project_manifest = json.loads(read(root / "infra.manifest.json"))
     assert project_manifest["enabled_plugins"] == ["auth", "tasks"]
     assert project_manifest["requested_plugins"] == ["auth", "tasks"]
     assert project_manifest["production_plugins"] == ["auth", "database", "tasks"]
@@ -412,7 +453,10 @@ def test_create_project_configures_only_requested_plugins(tmp_path):
         True,
     ]
     assert project_manifest["commands"]["production_static"] == ["make release-static"]
-    health_test = read(tmp_path / "service" / "tests" / "test_health.py")
+
+
+def _assert_auth_tasks_health_tests(root: Path) -> None:
+    health_test = read(root / "tests" / "test_health.py")
     assert "from infra.plugins import AUTH_SERVICE, TASKS_SERVICE" in health_test
     assert "EXPECTED_SERVICES = ['auth', 'tasks']" in health_test
     assert "assert infra.get(service_name) is not None" in health_test
@@ -473,6 +517,17 @@ def test_create_project_deduplicates_requested_plugins(tmp_path):
     assert "Enabled plugins: auth, tasks" in read(root / "README.md")
     assert "auth, auth" not in read(root / "README.md")
     assert "EXPECTED_SERVICES = ['auth', 'tasks']" in read(root / "tests" / "test_health.py")
+
+
+def test_create_project_preserves_requested_plugin_iterator_in_manifest(tmp_path):
+    root = tmp_path / "service"
+    requested_plugins = (plugin for plugin in ("auth", "tasks"))
+
+    create_project(root, "billing_api", enabled_plugins=requested_plugins)
+
+    project_manifest = json.loads(read(root / "infra.manifest.json"))
+    assert project_manifest["requested_plugins"] == ["auth", "tasks"]
+    assert project_manifest["enabled_plugins"] == ["auth", "tasks"]
 
 
 def test_create_project_can_use_profile_and_extra_plugins(tmp_path):

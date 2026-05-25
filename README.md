@@ -2,6 +2,85 @@
 
 一个干净的 FastAPI 基础设施层：核心只负责配置、生命周期、插件管理和健康聚合；AI、认证、支付、任务、存储等能力都作为可开关插件提供。
 
+## 当前支持的功能
+
+FastAPI Infra 目前定位为“可生成、可配置、可校验、可发布”的后端基础设施包。核心默认保持最小运行面，业务能力通过插件显式启用，适合从最小 API、worker、AI 服务到 SaaS 后端逐步扩展。
+
+### 核心能力
+
+| 能力 | 当前支持 |
+| --- | --- |
+| 项目脚手架 | `fastapi-infra new` 生成 FastAPI 项目、配置文件、测试、Dockerfile、CI、Makefile、env 模板和 `infra.manifest.json` |
+| 插件系统 | 内置插件默认关闭，通过 `InfraSettings.infra.plugins` 显式启用；支持服务注册、健康检查、依赖声明和 manifest hints |
+| 配置加载 | 支持 Python 对象、JSON/TOML 配置文件、双下划线环境变量覆盖，以及 `{ "$env" = "NAME" }` secret 引用 |
+| 静态校验 | `config-check` 校验插件配置、provider 参数和服务引用；`project-check` 校验生成项目文件和 manifest 一致性 |
+| 发布门禁 | `release-check` 检查生产配置是否仍使用 mock/local/memory provider、是否缺少持久化存储、健康探测或 provider 认证 |
+| Provider 认证 | `certify-providers` 支持 env 模板、preflight、JSON 报告和 opt-in live tests |
+| SQL 迁移 | `migrations new/list/migrate`，记录 checksum，支持互斥锁和事务 executor 注入 |
+| 打包验证 | `scripts/verify_local.py --package --smoke` 覆盖 wheel/sdist、twine、distribution check、生成项目和插件模板 smoke |
+
+### 内置插件
+
+| 插件 | 本地默认 | 生产推荐 | 说明 |
+| --- | --- | --- | --- |
+| `auth` | JWT/API key 本地配置 | 长 secret、签名 key 轮换、PBKDF2 API key hash | HS256 JWT、hashed API key、scope/role 校验、FastAPI dependency |
+| `database` | memory provider | MySQL + Redis connections | MySQL/Redis 连接管理，支持只启用其中一种 |
+| `cache` | memory | Redis | namespace cache，生产要求 Redis certification |
+| `http` | mock | aiohttp | outbound HTTP、timeout、幂等重试、trace/request header 透传、observability 指标 |
+| `observability` | memory metrics | Prometheus + OpenTelemetry | `/ops/healthz`、`/ops/readyz`、`/ops/metrics`、请求指标 middleware |
+| `ai` | mock | OpenAI/Anthropic/Gemini 或外部 provider | chat text、embeddings、provider registry、可选健康探测 |
+| `speech` | mock | OpenAI speech 或外部 provider | ASR/TTS、timeout、重试、健康探测 |
+| `payment` | mock | Stripe + database store | checkout、refund、idempotency key、Stripe webhook 签名、durable store |
+| `storage` | local filesystem | S3-compatible storage | put/get/list/presign，S3 使用 stdlib HTTP + SigV4，不依赖 boto3 |
+| `notifications` | noop | SMTP 或 signed webhook | 邮件发送、webhook 通知、生产签名/健康检查要求 |
+| `webhooks` | memory store | durable SQL store + signed providers | inbound webhook route、raw body 签名校验、provider + event id 幂等 |
+| `tasks` | memory queue | 生产任务队列 backend | idempotency、delay、retry、dead-letter、worker concurrency 和指标；内置 Redis Streams、SQS、Kafka 和 Celery broker backend，也支持外部 backend 扩展 |
+| `ratelimit` | memory | Redis | FastAPI dependency、固定窗口计数、`429` 和 rate limit headers |
+
+### 脚手架 profiles
+
+| Profile | 启用插件 | 用途 |
+| --- | --- | --- |
+| `minimal` | none | 最小 FastAPI 项目，所有可选插件显式关闭 |
+| `api` | `auth`, `database`, `cache`, `http`, `observability`, `ratelimit` | 常规 Web API |
+| `worker` | `database`, `cache`, `http`, `tasks`, `observability` | 后台任务/批处理服务 |
+| `ai` | `ai`, `speech`, `database`, `cache`, `http`, `observability` | AI 应用或模型网关 |
+| `saas` | `auth`, `database`, `cache`, `http`, `observability`, `payment`, `storage`, `notifications`, `webhooks`, `ratelimit`, `tasks` | SaaS 后端基础设施组合 |
+| `full` | 全部内置插件 | 集成探索和测试 |
+
+### 外部扩展
+
+当前可以生成两类外部包：
+
+- service plugin：新增一个完整服务插件，通过 `fastapi_infra.plugins` entry point 接入。
+- provider/backend adapter：扩展内置插件的厂商实现，目前模板支持 `ai`、`notifications`、`payment`、`ratelimit`、`speech`、`storage`、`tasks`、`webhook`。
+
+对应 entry point 包括：
+
+- `fastapi_infra.ai_providers`
+- `fastapi_infra.payment_providers`
+- `fastapi_infra.speech_providers`
+- `fastapi_infra.storage_providers`
+- `fastapi_infra.notification_providers`
+- `fastapi_infra.webhook_providers`
+- `fastapi_infra.task_queue_backends`
+- `fastapi_infra.ratelimit_backends`
+- `fastapi_infra.provider_checks`
+
+### Live provider certification
+
+当前 live tests 覆盖：
+
+- MySQL round trip
+- Redis cache round trip
+- Stripe checkout、Stripe webhook signature、Stripe + MySQL durable payment store
+- S3-compatible storage put/get/list/presign
+- OpenAI chat/embeddings
+- Anthropic chat
+- Gemini chat/embeddings
+- OpenAI speech ASR/TTS
+- SMTP email send
+
 ## 安装
 
 ```bash
@@ -91,8 +170,8 @@ fastapi-infra plugins check search --settings infra.example.toml --lifecycle
 包。当前模板覆盖 AI、支付、语音、存储、通知、webhook、tasks backend 和 ratelimit backend，适合 OpenRouter、自建网关、
 私有模型服务，Adyen、PayPal、Paddle 这类支付渠道，以及 Deepgram、ElevenLabs
 这类 ASR/TTS 服务、S3/R2/OSS/MinIO 这类对象存储、Twilio/SendGrid/飞书/Slack
-这类通知渠道，GitHub、Stripe、LemonSqueezy 这类入站事件源，以及 SQS、Celery、
-Kafka 这类任务队列后端、Upstash/Cloudflare KV 这类限流后端接入：
+这类通知渠道，GitHub、Stripe、LemonSqueezy 这类入站事件源，以及 NATS、Temporal
+这类非内置任务队列后端、Upstash/Cloudflare KV 这类限流后端接入：
 
 ```bash
 fastapi-infra plugins init openrouter providers/openrouter --kind provider --provider-kind ai
@@ -101,7 +180,7 @@ fastapi-infra plugins init deepgram providers/deepgram --kind provider --provide
 fastapi-infra plugins init r2 providers/r2 --kind provider --provider-kind storage
 fastapi-infra plugins init twilio providers/twilio --kind provider --provider-kind notifications
 fastapi-infra plugins init github providers/github --kind provider --provider-kind webhook
-fastapi-infra plugins init sqs providers/sqs --kind provider --provider-kind tasks
+fastapi-infra plugins init nats providers/nats --kind provider --provider-kind tasks
 fastapi-infra plugins init upstash providers/upstash --kind provider --provider-kind ratelimit
 cd providers/openrouter
 pip install -e ".[dev]"
@@ -737,23 +816,47 @@ Webhook provider 会以 JSON POST 发送通知内容；配置 `signing_secret` �
 `x-infra-timestamp` 和 `x-infra-signature` HMAC-SHA256 签名。生产发布检查会要求
 webhook 通知配置 `signing_secret`、`health_url` 和 `health_probe=True`。
 
-## Redis 任务队列
+## 任务队列
 
-`tasks` 插件启用后默认是内存队列。需要跨进程任务分发时可以切换到 Redis Streams：
+`tasks` 插件是生产任务队列抽象，不是 Redis 缓存的附属功能。它提供统一的
+enqueue/dequeue/complete/fail/retry/dead-letter 接口、幂等投递、延迟投递、重试、
+dead-letter、并发 worker 和指标。内存队列只适合本地开发和测试；生产环境需要选择
+持久化 backend。
+
+当前内置生产 backend 包括 Redis Streams、SQS、Kafka 和 Celery broker：
+
+- Redis Streams：适合已有 Redis 基础设施的任务流、consumer group、pending 任务恢复和跨进程 worker 分发。
+- SQS：适合 AWS 托管队列，支持 long polling、visibility timeout、FIFO group/dedup 参数和可选 dead-letter queue。
+- Kafka：适合事件流基础设施，使用 explicit commit，并可配置 dead-letter topic。
+- Celery broker：使用 Celery/Kombu 支持的 broker 作为队列 transport，复用 Celery 生态的 Redis/RabbitMQ 等 broker；这里仍由 `TaskWorker` 执行业务 handler，不是把任务交给 Celery worker 执行。
+
+需要其他队列时，仍可以通过 `fastapi_infra.task_queue_backends` entry point 接入外部
+backend；`fastapi-infra plugins init custom_queue providers/custom_queue --kind provider
+--provider-kind tasks` 会生成对应模板。
+
+使用内置 Redis Streams backend 时：
 
 ```python
 settings = InfraSettings(
     infra={
         "plugins": {
-            "database": {"enabled": True},
+            "database": {
+                "enabled": True,
+                "config": {"config": {"mysql_enabled": False, "redis_enabled": True}},
+            },
             "tasks": {
                 "enabled": True,
                 "config": {
-                    "adapter": "redis",
-                    "stream_name": "myapp:tasks",
-                    "consumer_group": "workers",
-                    "consumer_name": "worker-1",
-                    "pending_min_idle_ms": 60000,
+                    "default_provider": "redis",
+                    "providers": {
+                        "redis": {
+                            "database_service": "database",
+                            "stream_name": "myapp:tasks",
+                            "consumer_group": "workers",
+                            "consumer_name": "worker-1",
+                            "pending_min_idle_ms": 60000,
+                        }
+                    },
                 },
             },
         }
@@ -761,13 +864,97 @@ settings = InfraSettings(
 )
 ```
 
-Redis adapter 会创建 consumer group，空队列时非阻塞返回 `None`，并优先恢复
+Redis Streams backend 会创建 consumer group，空队列时非阻塞返回 `None`，并优先恢复
 超过 `pending_min_idle_ms` 的 pending 任务。Tasks 健康检查会确认注册队列存在；
-Redis 队列会执行 `PING`，Redis 不可用时插件会标记为 unhealthy。
-文件配置只描述 adapter 和 stream 参数；Redis client 是运行时对象，测试或高级嵌入
+Redis Streams 队列会执行 `PING`，Redis 不可用时插件会标记为 unhealthy。
+文件配置只描述 backend 和 stream 参数；Redis client 是运行时对象，测试或高级嵌入
 场景可以通过 `TasksPlugin(redis=client)` 注入。生产发布检查无法从配置文件证明
-这种运行时注入，因此 Redis adapter 生产配置应启用 database 插件并保持
-`redis_enabled=true`。provider certification 报告也必须覆盖 `redis`。
+这种运行时注入，因此内置 Redis Streams backend 的生产配置应启用 database 插件并保持
+`redis_enabled=true`。provider certification 报告也必须覆盖 `redis`。外部任务队列
+backend 应提供自己的 provider certification，并在生产发布门禁中覆盖对应 backend。
+
+使用 SQS backend：
+
+```python
+settings = InfraSettings(
+    infra={
+        "plugins": {
+            "tasks": {
+                "enabled": True,
+                "config": {
+                    "default_provider": "sqs",
+                    "providers": {
+                        "sqs": {
+                            "queue_url": "https://sqs.us-east-1.amazonaws.com/123/tasks",
+                            "region_name": "us-east-1",
+                            "wait_time_seconds": 10,
+                            "visibility_timeout": 60,
+                            "dead_letter_queue_url": "https://sqs.us-east-1.amazonaws.com/123/tasks-dlq",
+                        }
+                    },
+                },
+            }
+        }
+    }
+)
+```
+
+安装依赖：`pip install -e ".[tasks-sqs]"`。
+
+使用 Kafka backend：
+
+```python
+settings = InfraSettings(
+    infra={
+        "plugins": {
+            "tasks": {
+                "enabled": True,
+                "config": {
+                    "default_provider": "kafka",
+                    "providers": {
+                        "kafka": {
+                            "bootstrap_servers": "localhost:9092",
+                            "topic": "infra.tasks",
+                            "group_id": "workers",
+                            "dead_letter_topic": "infra.tasks.dead",
+                        }
+                    },
+                },
+            }
+        }
+    }
+)
+```
+
+安装依赖：`pip install -e ".[tasks-kafka]"`。
+
+使用 Celery broker backend：
+
+```python
+settings = InfraSettings(
+    infra={
+        "plugins": {
+            "tasks": {
+                "enabled": True,
+                "config": {
+                    "default_provider": "celery",
+                    "providers": {
+                        "celery": {
+                            "broker_url": "redis://localhost:6379/0",
+                            "queue_name": "infra.tasks",
+                            "exchange_name": "infra.tasks",
+                            "routing_key": "infra.tasks",
+                            "dead_letter_queue_name": "infra.tasks.dead",
+                        }
+                    },
+                },
+            }
+        }
+    }
+)
+```
+
+安装依赖：`pip install -e ".[tasks-celery]"`。
 
 任务 worker 可以直接绑定 handler。生产进程建议使用 `run_task_worker`，它会安装
 SIGINT/SIGTERM 停机处理，并在启动时拒绝没有 handler 的 worker：

@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 PluginProjectKind = Literal["service", "provider"]
@@ -90,237 +90,19 @@ def _provider_template_files(plugin_name: str, provider_kind: str) -> dict[Path,
     )
     class_prefix = f"{class_name(plugin_name)}{class_name(provider_kind)}"
     env_prefix = f"{plugin_name}_{provider_kind}".upper()
-    if provider_kind == "ratelimit":
-        return {
-            Path("README.md"): _render_ratelimit_provider_readme(plugin_name, package_name),
-            Path("pyproject.toml"): _render_provider_pyproject(
-                plugin_name,
-                provider_kind,
-                package_name,
-                module_name,
-            ),
-            Path("infra.example.toml"): _render_ratelimit_provider_infra_example(
-                plugin_name,
-            ),
-            Path("src")
-            / module_name
-            / "__init__.py": _render_ratelimit_provider_module(
-                plugin_name,
-                class_prefix=class_prefix,
-                env_prefix=env_prefix,
-            ),
-            Path("src")
-            / module_name
-            / "certification.py": _render_provider_certification(
-                plugin_name,
-                provider_kind,
-                env_prefix=env_prefix,
-            ),
-            Path("tests/test_provider.py"): _render_ratelimit_provider_test(
-                plugin_name,
-                module_name=module_name,
-                class_prefix=class_prefix,
-            ),
-        }
-    if provider_kind == "tasks":
-        return {
-            Path("README.md"): _render_tasks_provider_readme(plugin_name, package_name),
-            Path("pyproject.toml"): _render_provider_pyproject(
-                plugin_name,
-                provider_kind,
-                package_name,
-                module_name,
-            ),
-            Path("infra.example.toml"): _render_tasks_provider_infra_example(plugin_name),
-            Path("src")
-            / module_name
-            / "__init__.py": _render_tasks_provider_module(
-                plugin_name,
-                class_prefix=class_prefix,
-                env_prefix=env_prefix,
-            ),
-            Path("src")
-            / module_name
-            / "certification.py": _render_provider_certification(
-                plugin_name,
-                provider_kind,
-                env_prefix=env_prefix,
-            ),
-            Path("tests/test_provider.py"): _render_tasks_provider_test(
-                plugin_name,
-                module_name=module_name,
-                class_prefix=class_prefix,
-            ),
-        }
-    if provider_kind == "webhook":
-        return {
-            Path("README.md"): _render_webhook_provider_readme(plugin_name, package_name),
-            Path("pyproject.toml"): _render_provider_pyproject(
-                plugin_name,
-                provider_kind,
-                package_name,
-                module_name,
-            ),
-            Path("infra.example.toml"): _render_webhook_provider_infra_example(
-                plugin_name,
-            ),
-            Path("src")
-            / module_name
-            / "__init__.py": _render_webhook_provider_module(
-                plugin_name,
-                class_prefix=class_prefix,
-                env_prefix=env_prefix,
-            ),
-            Path("src")
-            / module_name
-            / "certification.py": _render_provider_certification(
-                plugin_name,
-                provider_kind,
-                env_prefix=env_prefix,
-            ),
-            Path("tests/test_provider.py"): _render_webhook_provider_test(
-                plugin_name,
-                module_name=module_name,
-                class_prefix=class_prefix,
-            ),
-        }
-    if provider_kind == "notifications":
-        return {
-            Path("README.md"): _render_notifications_provider_readme(
-                plugin_name,
-                package_name,
-            ),
-            Path("pyproject.toml"): _render_provider_pyproject(
-                plugin_name,
-                provider_kind,
-                package_name,
-                module_name,
-            ),
-            Path("infra.example.toml"): _render_notifications_provider_infra_example(
-                plugin_name,
-            ),
-            Path("src")
-            / module_name
-            / "__init__.py": _render_notifications_provider_module(
-                plugin_name,
-                class_prefix=class_prefix,
-                env_prefix=env_prefix,
-            ),
-            Path("src")
-            / module_name
-            / "certification.py": _render_provider_certification(
-                plugin_name,
-                provider_kind,
-                env_prefix=env_prefix,
-            ),
-            Path("tests/test_provider.py"): _render_notifications_provider_test(
-                plugin_name,
-                module_name=module_name,
-                class_prefix=class_prefix,
-            ),
-        }
-    if provider_kind == "storage":
-        return {
-            Path("README.md"): _render_storage_provider_readme(plugin_name, package_name),
-            Path("pyproject.toml"): _render_provider_pyproject(
-                plugin_name,
-                provider_kind,
-                package_name,
-                module_name,
-            ),
-            Path("infra.example.toml"): _render_storage_provider_infra_example(plugin_name),
-            Path("src")
-            / module_name
-            / "__init__.py": _render_storage_provider_module(
-                plugin_name,
-                class_prefix=class_prefix,
-                env_prefix=env_prefix,
-            ),
-            Path("src")
-            / module_name
-            / "certification.py": _render_provider_certification(
-                plugin_name,
-                provider_kind,
-                env_prefix=env_prefix,
-            ),
-            Path("tests/test_provider.py"): _render_storage_provider_test(
-                plugin_name,
-                module_name=module_name,
-                class_prefix=class_prefix,
-            ),
-        }
-    if provider_kind == "speech":
-        return {
-            Path("README.md"): _render_speech_provider_readme(plugin_name, package_name),
-            Path("pyproject.toml"): _render_provider_pyproject(
-                plugin_name,
-                provider_kind,
-                package_name,
-                module_name,
-            ),
-            Path("infra.example.toml"): _render_speech_provider_infra_example(plugin_name),
-            Path("src")
-            / module_name
-            / "__init__.py": _render_speech_provider_module(
-                plugin_name,
-                class_prefix=class_prefix,
-                env_prefix=env_prefix,
-            ),
-            Path("src")
-            / module_name
-            / "certification.py": _render_provider_certification(
-                plugin_name,
-                provider_kind,
-                env_prefix=env_prefix,
-            ),
-            Path("tests/test_provider.py"): _render_speech_provider_test(
-                plugin_name,
-                module_name=module_name,
-                class_prefix=class_prefix,
-            ),
-        }
-    if provider_kind == "payment":
-        return {
-            Path("README.md"): _render_payment_provider_readme(plugin_name, package_name),
-            Path("pyproject.toml"): _render_provider_pyproject(
-                plugin_name,
-                provider_kind,
-                package_name,
-                module_name,
-            ),
-            Path("infra.example.toml"): _render_payment_provider_infra_example(plugin_name),
-            Path("src")
-            / module_name
-            / "__init__.py": _render_payment_provider_module(
-                plugin_name,
-                class_prefix=class_prefix,
-                env_prefix=env_prefix,
-            ),
-            Path("src")
-            / module_name
-            / "certification.py": _render_provider_certification(
-                plugin_name,
-                provider_kind,
-                env_prefix=env_prefix,
-            ),
-            Path("tests/test_provider.py"): _render_payment_provider_test(
-                plugin_name,
-                module_name=module_name,
-                class_prefix=class_prefix,
-            ),
-        }
+    readme, infra_example, module, test = _provider_renderers(provider_kind)
     return {
-        Path("README.md"): _render_ai_provider_readme(plugin_name, package_name),
+        Path("README.md"): readme(plugin_name, package_name),
         Path("pyproject.toml"): _render_provider_pyproject(
             plugin_name,
             provider_kind,
             package_name,
             module_name,
         ),
-        Path("infra.example.toml"): _render_ai_provider_infra_example(plugin_name),
+        Path("infra.example.toml"): infra_example(plugin_name),
         Path("src")
         / module_name
-        / "__init__.py": _render_ai_provider_module(
+        / "__init__.py": module(
             plugin_name,
             class_prefix=class_prefix,
             env_prefix=env_prefix,
@@ -332,12 +114,79 @@ def _provider_template_files(plugin_name: str, provider_kind: str) -> dict[Path,
             provider_kind,
             env_prefix=env_prefix,
         ),
-        Path("tests/test_provider.py"): _render_ai_provider_test(
+        Path("tests/test_provider.py"): test(
             plugin_name,
             module_name=module_name,
             class_prefix=class_prefix,
         ),
     }
+
+
+ProviderReadmeRenderer = Callable[[str, str], str]
+ProviderInfraExampleRenderer = Callable[[str], str]
+ProviderModuleRenderer = Callable[..., str]
+ProviderTestRenderer = Callable[..., str]
+
+
+def _provider_renderers(
+    provider_kind: str,
+) -> tuple[
+    ProviderReadmeRenderer,
+    ProviderInfraExampleRenderer,
+    ProviderModuleRenderer,
+    ProviderTestRenderer,
+]:
+    renderers = {
+        "ai": (
+            _render_ai_provider_readme,
+            _render_ai_provider_infra_example,
+            _render_ai_provider_module,
+            _render_ai_provider_test,
+        ),
+        "notifications": (
+            _render_notifications_provider_readme,
+            _render_notifications_provider_infra_example,
+            _render_notifications_provider_module,
+            _render_notifications_provider_test,
+        ),
+        "payment": (
+            _render_payment_provider_readme,
+            _render_payment_provider_infra_example,
+            _render_payment_provider_module,
+            _render_payment_provider_test,
+        ),
+        "ratelimit": (
+            _render_ratelimit_provider_readme,
+            _render_ratelimit_provider_infra_example,
+            _render_ratelimit_provider_module,
+            _render_ratelimit_provider_test,
+        ),
+        "speech": (
+            _render_speech_provider_readme,
+            _render_speech_provider_infra_example,
+            _render_speech_provider_module,
+            _render_speech_provider_test,
+        ),
+        "storage": (
+            _render_storage_provider_readme,
+            _render_storage_provider_infra_example,
+            _render_storage_provider_module,
+            _render_storage_provider_test,
+        ),
+        "tasks": (
+            _render_tasks_provider_readme,
+            _render_tasks_provider_infra_example,
+            _render_tasks_provider_module,
+            _render_tasks_provider_test,
+        ),
+        "webhook": (
+            _render_webhook_provider_readme,
+            _render_webhook_provider_infra_example,
+            _render_webhook_provider_module,
+            _render_webhook_provider_test,
+        ),
+    }
+    return renderers[provider_kind]
 
 
 def _render_readme(plugin_name: str, package_name: str) -> str:
@@ -406,7 +255,18 @@ def _render_plugin_module(
     service_name = f"{class_prefix}Service"
     config_name = f"{class_prefix}Config"
     plugin_class_name = f"{class_prefix}Plugin"
-    return f"""from __future__ import annotations
+    return _PLUGIN_MODULE_TEMPLATE.format(
+        plugin_name=plugin_name,
+        module_name=module_name,
+        class_prefix=class_prefix,
+        env_prefix=env_prefix,
+        service_name=service_name,
+        config_name=config_name,
+        plugin_class_name=plugin_class_name,
+    )
+
+
+_PLUGIN_MODULE_TEMPLATE = """from __future__ import annotations
 
 from typing import Any
 
@@ -656,7 +516,15 @@ def _render_ai_provider_module(
 ) -> str:
     config_name = f"{class_prefix}ProviderConfig"
     provider_class_name = f"{class_prefix}Provider"
-    return f"""from __future__ import annotations
+    return _AI_PROVIDER_MODULE_TEMPLATE.format(
+        provider_name=provider_name,
+        env_prefix=env_prefix,
+        config_name=config_name,
+        provider_class_name=provider_class_name,
+    )
+
+
+_AI_PROVIDER_MODULE_TEMPLATE = """from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -875,7 +743,15 @@ def _render_payment_provider_module(
 ) -> str:
     config_name = f"{class_prefix}ProviderConfig"
     provider_class_name = f"{class_prefix}Provider"
-    return f"""from __future__ import annotations
+    return _PAYMENT_PROVIDER_MODULE_TEMPLATE.format(
+        provider_name=provider_name,
+        env_prefix=env_prefix,
+        config_name=config_name,
+        provider_class_name=provider_class_name,
+    )
+
+
+_PAYMENT_PROVIDER_MODULE_TEMPLATE = """from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
@@ -1285,7 +1161,15 @@ def _render_storage_provider_module(
 ) -> str:
     config_name = f"{class_prefix}ProviderConfig"
     provider_class_name = f"{class_prefix}Provider"
-    return f"""from __future__ import annotations
+    return _STORAGE_PROVIDER_MODULE_TEMPLATE.format(
+        provider_name=provider_name,
+        env_prefix=env_prefix,
+        config_name=config_name,
+        provider_class_name=provider_class_name,
+    )
+
+
+_STORAGE_PROVIDER_MODULE_TEMPLATE = """from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -1678,7 +1562,14 @@ def _render_webhook_provider_module(
 ) -> str:
     config_name = f"{class_prefix}ProviderConfig"
     provider_class_name = f"{class_prefix}Provider"
-    return f"""from __future__ import annotations
+    return _WEBHOOK_PROVIDER_MODULE_TEMPLATE.format(
+        provider_name=provider_name,
+        config_name=config_name,
+        provider_class_name=provider_class_name,
+    )
+
+
+_WEBHOOK_PROVIDER_MODULE_TEMPLATE = """from __future__ import annotations
 
 import hashlib
 import hmac
@@ -1867,7 +1758,14 @@ def _render_tasks_provider_module(
 ) -> str:
     config_name = f"{class_prefix}ProviderConfig"
     provider_class_name = f"{class_prefix}Provider"
-    return f"""from __future__ import annotations
+    return _TASKS_PROVIDER_MODULE_TEMPLATE.format(
+        provider_name=provider_name,
+        config_name=config_name,
+        provider_class_name=provider_class_name,
+    )
+
+
+_TASKS_PROVIDER_MODULE_TEMPLATE = """from __future__ import annotations
 
 import time
 from collections import deque
