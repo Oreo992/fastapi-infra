@@ -54,7 +54,11 @@ def _require_env(*names: str) -> dict[str, str]:
 
 
 def _require_module(module_name: str, install_name: str) -> None:
-    if importlib.util.find_spec(module_name) is None:
+    try:
+        available = importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        available = False
+    if not available:
         pytest.skip(f"live provider test requires installed package: {install_name}")
 
 

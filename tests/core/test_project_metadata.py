@@ -6541,6 +6541,19 @@ def test_generated_project_smoke_script_uses_generated_makefile(tmp_path, monkey
     module = _load_script("scripts/smoke_generated_projects.py")
     project_dir = tmp_path / "api_app"
     project_dir.mkdir()
+    (project_dir / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[project]",
+                'dependencies = ["fastapi-infra[http]", "uvicorn[standard]>=0.29"]',
+                "",
+                "[project.optional-dependencies]",
+                'dev = ["pytest>=8.0.0", "httpx>=0.27.0,<0.29.0"]',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     commands = []
     env_overlays = []
 
@@ -6562,6 +6575,20 @@ def test_generated_project_smoke_script_uses_generated_makefile(tmp_path, monkey
     )
 
     assert commands == [
+        (
+            [
+                "python",
+                "-m",
+                "pip",
+                "install",
+                "fastapi-infra[http]",
+                "uvicorn[standard]>=0.29",
+                "pytest>=8.0.0",
+                "httpx>=0.27.0,<0.29.0",
+            ],
+            project_dir,
+            7,
+        ),
         (["make", "env"], project_dir, 7),
         (["make", "verify"], project_dir, 7),
         (["make", "release-static"], project_dir, 7),
