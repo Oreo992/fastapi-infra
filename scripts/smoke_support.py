@@ -81,7 +81,7 @@ def run(
 
 def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
     run_env = dict(os.environ if env is None else env)
-    python_bin = str(Path(sys.executable).resolve().parent)
+    python_bin = str(Path(sys.executable).parent)
     shim_bin = _ensure_fastapi_infra_shim()
     existing_path = run_env.get("PATH")
     path_entries = [shim_bin, python_bin]

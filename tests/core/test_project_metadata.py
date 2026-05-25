@@ -6681,6 +6681,21 @@ def test_generated_project_smoke_script_private_target_includes_editable_pth_pat
     )
 
 
+def test_smoke_support_keeps_virtualenv_python_bin_on_path(tmp_path, monkeypatch) -> None:
+    module = _load_script("scripts/smoke_support.py")
+    fake_python = tmp_path / "venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    monkeypatch.setattr(module.sys, "executable", str(fake_python))
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    env = module._subprocess_env({"PATH": "base-path"})
+
+    assert env["PATH"].split(os.pathsep)[:2] == [
+        str(tmp_path / "fastapi-infra-smoke-bin"),
+        str(fake_python.parent),
+    ]
+
+
 def test_generated_project_smoke_script_has_external_plugin_mode() -> None:
     module = _load_script("scripts/smoke_generated_projects.py")
     parser = module._build_parser()
