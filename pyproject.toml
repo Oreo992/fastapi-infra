@@ -107,6 +107,23 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 
+[[tool.mypy.overrides]]
+module = [
+    "aiokafka.*",
+    "aiomysql.*",
+    "aiohttp.*",
+    "anthropic.*",
+    "boto3.*",
+    "google.*",
+    "kombu.*",
+    "openai.*",
+    "opentelemetry.*",
+    "orjson.*",
+    "prometheus_client.*",
+    "redis.*",
+]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
